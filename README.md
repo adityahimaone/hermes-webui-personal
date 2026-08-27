@@ -1,3 +1,17 @@
+# Hermes WebUI — Personal
+
+> Personal fork of [nesquena/hermes-webui](https://github.com/nesquena/hermes-webui) — tailored for my VPS + Mac workflow. Upstream: `origin`, personal: `personal`.
+
+## Personal tweaks
+
+- **Kanban gates:** preflight-approval → Approve, review-required → Commit/Request fix, push-approval → Push (system modals, not browser prompt)
+- **Remote SSH / workspace:** remote workspace fallback, evomem, shadcn combobox
+- **Server hardening:** clear delegated child context to avoid kanban DB lock
+
+Sync upstream: `git fetch origin && git merge origin/master`
+
+---
+
 # Hermes Web UI
 
 [Hermes Agent](https://hermes-agent.nousresearch.com/) is a sophisticated autonomous agent that lives on your server, accessed via a terminal or messaging apps, that remembers what it learns and gets more capable the longer it runs.
