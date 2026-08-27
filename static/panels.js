@@ -2431,9 +2431,43 @@ function _kanbanCardStalenessClass(task){
 function _kanbanCardQuickActions(task){
   const id = esc(task.id || '');
   const status = task.status || '';
+  if(status === 'running'){
+    return `<div class="kanban-card-actions" onclick="event.stopPropagation()">`
+      + `<button type="button" class="kanban-card-action danger" onclick="kanbanStopTask(event,'${id}')" title="Stop worker & return to queue">⏹ Stop</button>`
+      + `<button type="button" class="kanban-card-action" onclick="kanbanPauseTask(event,'${id}')" title="Stop & block task">⏸ Pause</button>`
+      + `</div>`;
+  }
+  if(status === 'blocked'){
+    return `<div class="kanban-card-actions" onclick="event.stopPropagation()">`
+      + `<button type="button" class="kanban-card-action" onclick="quickKanbanCardAction(event,'${id}','ready')" title="Unblock & queue">▶ Resume</button>`
+      + `<button type="button" class="kanban-card-action danger" onclick="quickKanbanCardAction(event,'${id}','archived')">${esc(t('kanban_card_archive'))}</button>`
+      + `</div>`;
+  }
   const complete = status !== 'done' && status !== 'archived' ? `<button type="button" class="kanban-card-action" onclick="quickKanbanCardAction(event,'${id}','done')">${esc(t('kanban_card_complete'))}</button>` : '';
   const archive = status !== 'archived' ? `<button type="button" class="kanban-card-action danger" onclick="quickKanbanCardAction(event,'${id}','archived')">${esc(t('kanban_card_archive'))}</button>` : '';
   return `<div class="kanban-card-actions" onclick="event.stopPropagation()">${complete}${archive}</div>`;
+}
+
+async function kanbanStopTask(event, taskId){
+  if(event) event.stopPropagation();
+  if(!confirm('Stop this running task? Worker will be terminated and task returns to queue.')) return;
+  try{
+    await api('/api/kanban/tasks/'+encodeURIComponent(taskId)+'/reclaim'+_kanbanBoardQuery(), {method:'POST', body: JSON.stringify({reason:'stopped from card'})});
+    showToast('Task stopped');
+    loadKanban(true);
+    if(_kanbanDetailTaskId === taskId) loadKanbanTask(taskId);
+  }catch(e){ showToast('Stop failed: '+(e.message||e)); }
+}
+
+async function kanbanPauseTask(event, taskId){
+  if(event) event.stopPropagation();
+  if(!confirm('Pause this task? Worker stopped and task will be blocked.')) return;
+  try{
+    await api('/api/kanban/tasks/'+encodeURIComponent(taskId)+'/pause'+_kanbanBoardQuery(), {method:'POST', body: JSON.stringify({reason:'paused from card'})});
+    showToast('Task paused');
+    loadKanban(true);
+    if(_kanbanDetailTaskId === taskId) loadKanbanTask(taskId);
+  }catch(e){ showToast('Pause failed: '+(e.message||e)); }
 }
 
 async function quickKanbanCardAction(event, taskId, status){
@@ -3092,6 +3126,60 @@ function _kanbanRunHtml(run){
   </div>`;
 }
 
+
+function _colorizeWorkerLog(text){
+  // Minimal ANSI-ish colorization for worker logs — no deps, pure string replace.
+  // Handles: Reasoning blocks, Hermes agent messages, shell commands, errors, success.
+  if(!text) return '';
+  const esc2 = (s) => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  const lines = esc2(text).split('\n');
+  return lines.map(line => {
+    const raw = line.trim();
+    // Reasoning blocks
+    if(raw.startsWith('┌─ Reasoning') || raw.startsWith('└─')) return `<span class="klog-reasoning">${line}</span>`;
+    if(raw.startsWith('╭─') || raw.startsWith('╰─')) return `<span class="klog-hermes">${line}</span>`;
+    // Shell prompt
+    if(/^\s*\$\s/.test(line) || /^\s*💻/.test(line)) return `<span class="klog-cmd">${line}</span>`;
+    // Error / warning
+    if(/error|failed|fail|spawn_failed|Permission denied/i.test(raw)) return `<span class="klog-error">${line}</span>`;
+    if(/warning|warn/i.test(raw)) return `<span class="klog-warn">${line}</span>`;
+    // Success
+    if(/success|done|completed|✓|✔/i.test(raw)) return `<span class="klog-success">${line}</span>`;
+    // Info / preparing
+    if(/preparing|Initializing|Query:/i.test(raw)) return `<span class="klog-info">${line}</span>`;
+    return line;
+  }).join('\n');
+}
+function _kanbanWorkerLogSection(log, taskId){
+  const hasContent = !!(log && log.content && log.content.trim());
+  const title = esc(t('kanban_worker_log') || 'Worker log');
+  const copyBtn = hasContent ? `<button class="btn secondary klog-copy-btn" onclick="navigator.clipboard.writeText(document.getElementById('klog-pre-'+esc(taskId)).textContent).then(()=>showToast('Copied'))" title="Copy log">Copy</button>` : '';
+  const body = hasContent
+    ? `<pre class="kanban-detail-pre klog-pre" id="klog-pre-${esc(taskId)}">${_colorizeWorkerLog(log.content)}</pre>`
+    : `<div class="kanban-detail-empty">${esc(t('kanban_empty')||'No log yet')}</div>`;
+  const meta = hasContent && log.size_bytes ? `<span class="klog-meta">${(log.size_bytes/1024).toFixed(1)} KB${log.truncated?' · truncated':''}</span>` : '';
+  return `<section class="kanban-detail-section kanban-detail-log">
+    <div class="klog-header"><h3>${title}</h3><div class="klog-actions">${meta}${copyBtn}</div></div>
+    ${body}
+  </section>`;
+}
+
+
+function _kanbanCommentsSection(comments, taskId){
+  const title = String(t('kanban_comments_count')||'Comments').replace('{0}', comments.length);
+  const body = comments.length
+    ? comments.map(_kanbanCommentHtml).join('')
+    : `<div class="kanban-detail-empty">${esc(t('kanban_no_comments')||'No comments')}</div>`;
+  return `<section class="kanban-detail-section kanban-detail-comments">
+    <div class="klog-header"><h3>${esc(title)}</h3></div>
+    ${body}
+    <div class="kanban-comment-form" style="margin-top:10px">
+      <textarea id="kanbanCommentInput" rows="2" placeholder="${esc(t('kanban_add_comment')||'Add a comment')}"></textarea>
+      <button class="btn primary" onclick="addKanbanComment('${esc(taskId)}')">${esc(t('kanban_add_comment')||'Comment')}</button>
+    </div>
+  </section>`;
+}
+
 function _kanbanJsArg(s){
   // Encode a value for safe interpolation inside an inline on* handler's JS
   // string literal. JSON.stringify quotes/escapes for JS context; esc() then
@@ -3315,6 +3403,7 @@ function openKanbanCreate(){
   });
   _kanbanPopulateTenantDatalist();
   _kanbanPopulateWorkspacePathDatalist();
+  _initKanbanTaskWorkspaceCombobox();
   _kanbanPopulateParentsDatalist();
   modal.hidden = false;
   if (_kanbanTaskModalFocusCleanup) {
@@ -3370,6 +3459,16 @@ async function openKanbanEdit(taskId){
   _kanbanSetTaskModalStatusHint(originalStatus, initialDisplayedStatus);
   _kanbanSetTaskModalLabels('edit');
   _kanbanPopulateTenantDatalist();
+  // Workspace path combobox (with status dot) — init after populate so workspace list ready
+  try { _kanbanPopulateWorkspacePathDatalist(); } catch(_){}
+  try { _initKanbanTaskWorkspaceCombobox(); } catch(_){}
+  // Pre-fill combobox with task's workspace path
+  try {
+    var wpEl = document.getElementById('kanbanTaskModalWorkspacePath');
+    if (wpEl && task.workspace_path) wpEl.value = task.workspace_path;
+    if (_kanbanTaskWorkspaceCombobox && task.workspace_path) _kanbanTaskWorkspaceCombobox.setValue(task.workspace_path);
+    else if (wpEl && wpEl._comboboxSync) wpEl._comboboxSync();
+  } catch(_){}
   modal.hidden = false;
   if (_kanbanTaskModalFocusCleanup) {
     _kanbanTaskModalFocusCleanup();
@@ -3463,12 +3562,22 @@ function _kanbanPopulateWorkspacePathDatalist(){
   const cols = (_kanbanBoard && _kanbanBoard.columns) || [];
   const seen = new Set();
   const opts = [];
+  // Existing task paths
   for (const col of cols) {
     for (const task of (col.tasks || [])) {
       const path = task && task.workspace_path;
       if (!path || seen.has(path)) continue;
       seen.add(path);
       opts.push(`<option value="${esc(path)}"></option>`);
+    }
+  }
+  // Plus webui workspaces (evonic workplaces mirror)
+  if (Array.isArray(_workspaceList)) {
+    for (const ws of _workspaceList) {
+      const p = ws && ws.path;
+      if (!p || seen.has(p)) continue;
+      seen.add(p);
+      opts.push(`<option value="${esc(p)}"></option>`);
     }
   }
   const list = document.getElementById('kanbanTaskModalWorkspacePathList');
@@ -3747,6 +3856,38 @@ async function removeKanbanDependency(parentId, childId){
   } catch(e) { showToast(t('kanban_unavailable') + ': ' + (e.message || e), 'error'); }
 }
 
+function _kanbanGateInfo(task, events){
+  if(!task || task.status !== 'blocked' || !events) return null;
+  var last=null; for(var i=events.length-1;i>=0;i--){ if(events[i]&&events[i].kind==='blocked'){ last=events[i]; break; } }
+  if(!last) return null;
+  var pl=last.payload; if(typeof pl==='string'){ try{ pl=JSON.parse(pl); }catch(_e){ pl={}; } }
+  var reason=(pl&&pl.reason)||'';
+  if(reason.indexOf('preflight-approval:')===0) return {kind:'preflight',reason:reason};
+  if(reason.indexOf('review-required:')===0) return {kind:'review',reason:reason};
+  if(reason.indexOf('push-approval:')===0) return {kind:'push',reason:reason};
+  return null;
+}
+function _kanbanGateHtml(task, events){
+  var gi=_kanbanGateInfo(task,events); if(!gi) return '';
+  var labels={preflight:'Preflight failed \u2014 approve to continue',review:'Work done \u2014 review and approve',push:'Ready to push'};
+  var btns='';
+  if(gi.kind==='preflight') btns+=`<button class="btn primary" onclick="kanbanGateAction('${task.id}','approve')">Approve preflight</button>`;
+  if(gi.kind==='review') btns+=`<button class="btn primary" onclick="kanbanGateAction('${task.id}','commit')">Commit</button><button class="btn secondary" onclick="kanbanGateFix('${task.id}')">Request fix</button>`;
+  if(gi.kind==='push') btns+=`<button class="btn primary" onclick="kanbanGateAction('${task.id}','push')">Push</button>`;
+  return `<div class="kanban-gate" style="margin:12px 0;padding:12px;border:1px solid var(--border);border-radius:8px;background:var(--panel);"><div style="font-weight:600;margin-bottom:6px;">${labels[gi.kind]}</div><div style="font-size:12px;color:var(--muted);word-break:break-word;margin-bottom:8px;">${esc(gi.reason)}</div><div style="display:flex;gap:8px;flex-wrap:wrap;">${btns}</div></div>`;
+}
+async function kanbanGateAction(taskId, comment){
+  try{
+    await api('/api/kanban/tasks/'+encodeURIComponent(taskId)+'/comments'+_kanbanBoardQuery(),{method:'POST',body:JSON.stringify({body:comment})});
+    await api('/api/kanban/tasks/'+encodeURIComponent(taskId)+_kanbanBoardQuery(),{method:'PATCH',body:JSON.stringify({status:'ready'})});
+    await loadKanbanTask(taskId); await _kanbanRefreshBoard();
+  }catch(e){ showToast(e.message||String(e),4000,'error'); }
+}
+async function kanbanGateFix(taskId){
+  var msg=prompt('Fix notes (posted as comment):'); if(!msg) return;
+  await kanbanGateAction(taskId,'fix: '+msg);
+}
+
 function _kanbanRenderTaskDetail(data){
   const task = data.task || {};
   const log = data.log || {};
@@ -3762,9 +3903,14 @@ function _kanbanRenderTaskDetail(data){
   // bridge rejects PATCH status='running' with HTTP 400 to match the agent
   // dashboard plugin's contract. UI users want to claim/promote a ready task
   // via the dispatcher Nudge button, not flip it to running by hand.
+  const isRunning = task.status === 'running';
+  const isBlocked = task.status === 'blocked';
+  const runningControls = isRunning
+    ? `<button class="btn danger" onclick="kanbanStopTask(event,'${esc(task.id)}')">⏹ Stop</button><button class="btn secondary" onclick="kanbanPauseTask(event,'${esc(task.id)}')">⏸ Pause</button>`
+    : isBlocked ? `<button class="btn primary" onclick="updateKanbanTask('${esc(task.id)}',{status:'ready'})">▶ Resume</button>` : '';
   const statusButtons = ['triage', 'todo', 'ready', 'blocked', 'done', 'archived'].map(status =>
     `<button class="btn secondary" onclick="updateKanbanTask('${esc(task.id)}',{status:'${status}'})">${esc(_kanbanColumnLabel(status))}</button>`
-  ).join('') + `<button class="btn secondary" onclick="blockKanbanTask('${esc(task.id)}')">${esc(t('kanban_block'))}</button><button class="btn secondary" onclick="unblockKanbanTask('${esc(task.id)}')">${esc(t('kanban_unblock'))}</button>`;
+  ).join('') + runningControls + `<button class="btn secondary" onclick="blockKanbanTask('${esc(task.id)}')">${esc(t('kanban_block'))}</button><button class="btn secondary" onclick="unblockKanbanTask('${esc(task.id)}')">${esc(t('kanban_unblock'))}</button>`;
   return `<div class="kanban-task-preview-header">
       <button class="btn secondary kanban-back-btn" onclick="closeKanbanTaskDetail()">${esc(t('kanban_back_to_board'))}</button>
       <div class="kanban-task-preview-title">${esc(title)}</div>
@@ -3772,17 +3918,18 @@ function _kanbanRenderTaskDetail(data){
     </div>
     <div class="kanban-task-preview-body">${_kanbanRenderMarkdown(body)}</div>
     ${meta.length ? `<div class="kanban-meta">${esc(meta.join(' · '))}</div>` : ''}
+    ${_kanbanGateHtml(task, events)}
     <div class="kanban-status-actions">${statusButtons}</div>
     <div class="kanban-detail-grid">
-      ${_kanbanDetailSection('kanban-detail-comments', String(t('kanban_comments_count')).replace('{0}', comments.length), comments.map(_kanbanCommentHtml).join(''), 'kanban_no_comments')}
       ${_kanbanDetailSection('kanban-detail-events', String(t('kanban_events_count')).replace('{0}', events.length), events.map(_kanbanEventHtml).join(''), 'kanban_no_events')}
       ${_kanbanDetailSection('kanban-detail-links', t('kanban_links'), _kanbanLinksHtml(links), 'kanban_empty')}
       ${_kanbanDetailSection('kanban-detail-runs', String(t('kanban_runs_count')).replace('{0}', runs.length), runs.map(_kanbanRunHtml).join(''), 'kanban_no_runs')}
-      ${_kanbanDetailSection('kanban-detail-log', t('kanban_worker_log'), log.content ? `<pre class="kanban-detail-pre">${esc(log.content)}</pre>` : '', 'kanban_empty')}
     </div>
-    <div class="kanban-comment-form">
-      <textarea id="kanbanCommentInput" rows="2" placeholder="${esc(t('kanban_add_comment'))}"></textarea>
-      <button class="btn primary" onclick="addKanbanComment('${esc(task.id)}')">${esc(t('kanban_add_comment'))}</button>
+    <div class="kanban-detail-log-full">
+      ${_kanbanWorkerLogSection(log, task.id)}
+    </div>
+    <div class="kanban-detail-comments-full">
+      ${_kanbanCommentsSection(comments, task.id)}
     </div>`;
 }
 
@@ -3893,6 +4040,7 @@ function _legacyTodosFromMessages() {
 // actions to create / rename / archive.
 
 const KANBAN_BOARD_LS_KEY = 'hermes-kanban-active-board';
+let _kanbanAutoSwitched = false;
 
 function _kanbanGetSavedBoard(){
   try { return localStorage.getItem(KANBAN_BOARD_LS_KEY) || null; } catch(_) { return null; }
@@ -3945,6 +4093,19 @@ async function loadKanbanBoards(){
     if (activeMeta.color) iconEl.style.color = activeMeta.color;
     else iconEl.style.color = '';
   }
+  // Board color accent: tint the kanban panel header + board switcher toggle
+  try {
+    const kanbanPanel = document.getElementById('kanbanPanel') || document.querySelector('[data-panel="kanban"]');
+    const switcherToggle = document.getElementById('kanbanBoardSwitcherToggle');
+    const safeColor = _kanbanSafeColor(activeMeta.color);
+    if (safeColor) {
+      if (kanbanPanel) kanbanPanel.style.setProperty('--kanban-board-accent', safeColor);
+      if (switcherToggle) { switcherToggle.style.borderColor = safeColor; switcherToggle.style.color = safeColor; }
+    } else {
+      if (kanbanPanel) kanbanPanel.style.removeProperty('--kanban-board-accent');
+      if (switcherToggle) { switcherToggle.style.borderColor = ''; switcherToggle.style.color = ''; }
+    }
+  } catch(_) {}
   // Re-render the menu (in case it was open or changed)
   _renderKanbanBoardMenu(boards, active);
 }
@@ -4043,6 +4204,7 @@ async function switchKanbanBoard(slug){
   }
   _kanbanCurrentBoard = newBoard;
   _kanbanSetSavedBoard(slug);
+  _kanbanAutoSwitched = true;
   _kanbanLatestEventId = 0;  // reset cursor — new board has its own event sequence
   _kanbanBoardMenuOpen = false;
   const menu = document.getElementById('kanbanBoardSwitcherMenu');
@@ -4051,13 +4213,11 @@ async function switchKanbanBoard(slug){
   try {
     await api('/api/kanban/boards/' + encodeURIComponent(slug) + '/switch', {method: 'POST'});
   } catch(e) {
-    // Local UI switch still happens — the on-disk pointer is for cross-process
-    // consistency, not for our own rendering.
+    showToast('Board switch (server): ' + (e.message || e), 'warning');
   }
   // Re-open the SSE stream on the new board.
   _kanbanStopPolling();
   await loadKanban(true);
-  await loadKanbanBoards();
   _kanbanStartPolling();
 }
 
@@ -4065,12 +4225,87 @@ async function switchKanbanBoard(slug){
 
 async function _loadKanbanBoardWorkdirOptions(){
   await loadWorkspaceList();
+  // Legacy datalist fallback (hidden) + refresh comboboxes if open
   const list = document.getElementById('kanbanBoardModalWorkdirs');
-  if (!list) return;
-  list.innerHTML = (_workspaceList || []).map(ws => {
-    const path = typeof ws === 'string' ? ws : ws && ws.path;
-    return path ? `<option value="${esc(path)}"></option>` : '';
-  }).join('');
+  if (list) {
+    list.innerHTML = (_workspaceList || []).map(ws => {
+      const path = typeof ws === 'string' ? ws : ws && ws.path;
+      return path ? `<option value="${esc(path)}"></option>` : '';
+    }).join('');
+  }
+  const items = Array.isArray(_workspaceList) ? _workspaceList.slice() : [];
+  if (_kanbanBoardWorkdirCombobox) _kanbanBoardWorkdirCombobox.setWorkspaces(items);
+  if (typeof _kanbanTaskPathCombobox !== 'undefined' && _kanbanTaskPathCombobox) _kanbanTaskPathCombobox.setWorkspaces(items);
+  if (_kanbanTaskWorkspaceCombobox) _kanbanTaskWorkspaceCombobox.setWorkspaces(items);
+}
+
+function _kanbanWorkspaceItems(){
+  return Array.isArray(_workspaceList) ? _workspaceList.slice() : [];
+}
+
+var _kanbanBoardWorkdirCombobox = null;
+function _initKanbanBoardWorkdirCombobox(){
+  var host = document.getElementById('kanbanBoardModalDefaultWorkdirCombobox');
+  var hidden = document.getElementById('kanbanBoardModalDefaultWorkdir');
+  if (!host || !hidden) return;
+  if (typeof createWorkspaceCombobox !== 'function') return;
+  var curVal = (hidden.value || '').trim();
+  var ws = Array.isArray(_workspaceList) ? _workspaceList : [];
+  if (_kanbanBoardWorkdirCombobox) { try { _kanbanBoardWorkdirCombobox.destroy(); } catch(_){} _kanbanBoardWorkdirCombobox = null; }
+  host.innerHTML = '';
+  _kanbanBoardWorkdirCombobox = createWorkspaceCombobox(host, {
+    workspaces: ws,
+    value: curVal,
+    placeholder: t('ws_search_placeholder') || 'Search workspaces…',
+    customPlaceholder: t('kanban_board_default_workdir_placeholder') || 'Workspace path (optional)',
+    allowCustomValue: true,
+    onSelect: function(path){ hidden.value = path || ''; },
+    onCreateNew: function(){ promptWorkspacePath(); }
+  });
+  // Keep hidden input → combobox sync if value set programmatically before open
+  hidden._comboboxSync = function(){ if(_kanbanBoardWorkdirCombobox) _kanbanBoardWorkdirCombobox.setValue((hidden.value||'').trim()); };
+}
+
+var _kanbanTaskWorkspaceCombobox = null;
+function _initKanbanTaskWorkspaceCombobox(){
+  var host = document.getElementById('kanbanTaskModalWorkspacePathCombobox');
+  var hidden = document.getElementById('kanbanTaskModalWorkspacePath');
+  if (!host || !hidden) return;
+  if (typeof createWorkspaceCombobox !== 'function') return;
+  // Build combined list: existing task paths + workspaces
+  var seen = new Set();
+  var combined = [];
+  var cols = (_kanbanBoard && _kanbanBoard.columns) || [];
+  for (var ci=0; ci<cols.length; ci++){
+    var tasks = cols[ci].tasks || [];
+    for (var ti=0; ti<tasks.length; ti++){
+      var p = tasks[ti] && tasks[ti].workspace_path;
+      if (!p || seen.has(p)) continue;
+      seen.add(p);
+      combined.push({ name: p.split('/').filter(Boolean).pop() || p, path: p });
+    }
+  }
+  if (Array.isArray(_workspaceList)){
+    for (var wi=0; wi<_workspaceList.length; wi++){
+      var wp = _workspaceList[wi] && _workspaceList[wi].path;
+      if (!wp || seen.has(wp)) continue;
+      seen.add(wp);
+      combined.push(_workspaceList[wi]);
+    }
+  }
+  var curVal = (hidden.value || '').trim();
+  if (_kanbanTaskWorkspaceCombobox) { try { _kanbanTaskWorkspaceCombobox.destroy(); } catch(_){} _kanbanTaskWorkspaceCombobox = null; }
+  host.innerHTML = '';
+  _kanbanTaskWorkspaceCombobox = createWorkspaceCombobox(host, {
+    workspaces: combined,
+    value: curVal,
+    placeholder: t('ws_search_placeholder') || 'Search workspaces…',
+    customPlaceholder: t('kanban_workspace_path_placeholder') || 'Path to workspace',
+    allowCustomValue: true,
+    onSelect: function(path){ hidden.value = path || ''; },
+    onCreateNew: function(){ promptWorkspacePath(); }
+  });
+  hidden._comboboxSync = function(){ if(_kanbanTaskWorkspaceCombobox) _kanbanTaskWorkspaceCombobox.setValue((hidden.value||'').trim()); };
 }
 
 function openKanbanCreateBoard(){
@@ -4088,7 +4323,7 @@ function openKanbanCreateBoard(){
   document.getElementById('kanbanBoardModalColor').value = '#7aa2ff';
   document.getElementById('kanbanBoardModalDefaultWorkdir').value = '';
   document.getElementById('kanbanBoardModalOriginalDefaultWorkdir').value = '';
-  _loadKanbanBoardWorkdirOptions();
+  _loadKanbanBoardWorkdirOptions().then(function(){ try { _initKanbanBoardWorkdirCombobox(); } catch(_){} });
   document.getElementById('kanbanBoardModalError').textContent = '';
   modal.hidden = false;
   if (_kanbanBoardModalFocusCleanup) {
@@ -4135,7 +4370,7 @@ function openKanbanRenameBoard(){
   const originalDefaultWorkdir = (meta.default_workdir || '').trim();
   document.getElementById('kanbanBoardModalDefaultWorkdir').value = originalDefaultWorkdir;
   document.getElementById('kanbanBoardModalOriginalDefaultWorkdir').value = originalDefaultWorkdir;
-  _loadKanbanBoardWorkdirOptions();
+  _loadKanbanBoardWorkdirOptions().then(function(){ try { _initKanbanBoardWorkdirCombobox(); } catch(_){} });
   document.getElementById('kanbanBoardModalError').textContent = '';
   modal.hidden = false;
   if (_kanbanBoardModalFocusCleanup) {
@@ -5288,6 +5523,7 @@ const MEMORY_SECTIONS = [
   { key: 'memory', labelKey: 'my_notes', emptyKey: 'no_notes_yet', iconKey: 'brain' },
   { key: 'user',   labelKey: 'user_profile', emptyKey: 'no_profile_yet', iconKey: 'user' },
   { key: 'soul',   labelKey: 'agent_soul', emptyKey: 'no_soul_yet', iconKey: 'sparkles' },
+  { key: 'knowledge', label: 'Knowledge', empty: 'No knowledge docs yet.', iconKey: 'book-open' },
   { key: 'project_context', label: 'Project Context', empty: 'No project context file found for this workspace.', iconKey: 'file-text', readOnly: true },
   { key: 'external_notes', labelKey: 'external_notes_sources', emptyKey: 'external_notes_empty', iconKey: 'book-open' },
 ];
@@ -5423,6 +5659,10 @@ function _renderMemoryDetail(section) {
     _renderExternalNotesSources();
     return;
   }
+  if (section === 'knowledge') {
+    _renderKnowledgeDetail();
+    return;
+  }
 
   const meta = _memorySectionMeta(section);
   const title = $('memoryDetailTitle');
@@ -5540,6 +5780,256 @@ async function previewExternalNote(source, id) {
   _renderExternalNotesSources();
 }
 
+// ── Knowledge (evomem kb/) — Evonic mirror ──
+let _kbData = null;
+let _kbGraphData = null;
+let _kbView = 'list'; // list | graph
+let _kbFilter = '';
+let _kbProfile = ''; // selected profile for knowledge
+
+async function _loadKnowledge(view, profile) {
+  if (profile !== undefined) _kbProfile = profile;
+  _kbView = view || _kbView;
+  const p = _kbProfile || (_profilesCache && _profilesCache.active) || '';
+  const v = _kbView === 'graph' ? 'graph' : 'list';
+  // Use active profile; backend falls back to jihyo if default has no kb
+  try {
+    const data = await api(`/api/knowledge?profile=${encodeURIComponent(p)}&view=${v}`);
+    if (v === 'graph') _kbGraphData = data;
+    else _kbData = data;
+  } catch(e) {
+    if (v === 'graph') _kbGraphData = {error: e.message || String(e)};
+    else _kbData = {error: e.message || String(e)};
+  }
+}
+
+function _renderKnowledgeDetail() {
+  const title = $('memoryDetailTitle');
+  const body = $('memoryDetailBody');
+  const empty = $('memoryDetailEmpty');
+  if (!title || !body) return;
+  title.textContent = 'Knowledge';
+  const isGraph = _kbView === 'graph';
+  const data = isGraph ? _kbGraphData : _kbData;
+  if (!data) {
+    body.innerHTML = `<div class="main-view-content"><div class="memory-empty">Loading knowledge…</div></div>`;
+    body.style.display = '';
+    if (empty) empty.style.display = 'none';
+    _memoryMode = 'read';
+    _setMemoryHeaderButtons('read');
+    _loadKnowledge(_kbView).then(() => _renderKnowledgeDetail());
+    return;
+  }
+  if (data.error) {
+    body.innerHTML = `<div class="main-view-content"><div class="detail-form-error">${esc(data.error)}</div></div>`;
+    body.style.display = '';
+    if (empty) empty.style.display = 'none';
+    _memoryMode = 'read';
+    _setMemoryHeaderButtons('read');
+    return;
+  }
+  const toggleHtml = `<div style="display:flex;gap:6px;margin-bottom:12px;flex-wrap:wrap;align-items:center">
+    <button class="btn secondary small ${!isGraph?'primary':''}" onclick="_kbSwitchView('list')" style="${!isGraph?'background:var(--accent);color:#fff;border-color:var(--accent)':''}">${li('list',14)} List</button>
+    <button class="btn secondary small ${isGraph?'primary':''}" onclick="_kbSwitchView('graph')" style="${isGraph?'background:var(--accent);color:#fff;border-color:var(--accent)':''}">${li('git-branch',14)} Graph</button>
+    <select onchange="_kbSwitchProfile(this.value)" style="padding:6px 8px;border:1px solid var(--border);border-radius:var(--radius-md);font-size:12px;background:var(--input-bg);color:var(--text)">
+      ${(_profilesCache && _profilesCache.profiles||[]).map(p=>`<option value="${esc(p.name)}" ${p.name===(_kbProfile||(_profilesCache&&_profilesCache.active))?'selected':''}>${esc(p.name)}</option>`).join('')}
+    </select>
+    <input type="search" placeholder="Filter…" value="${esc(_kbFilter)}" oninput="_kbFilter=this.value;_renderKnowledgeDetail()" style="flex:1;min-width:120px;max-width:220px;padding:6px 10px;border:1px solid var(--border);border-radius:var(--radius-md);font-size:12px;background:var(--input-bg);color:var(--text)">
+  </div>`;
+  const kbPath = data.kb_path || '';
+  const pathHtml = kbPath ? `<div class="memory-detail-mtime">${esc(kbPath)} · ${esc(String(data.count||0))} docs</div>` : '';
+  let contentHtml = '';
+  if (isGraph) {
+    const nodes = data.nodes || {};
+    const links = Array.isArray(data.links) ? data.links : [];
+    const dangling = Array.isArray(data.dangling) ? data.dangling : [];
+    const q = _kbFilter.toLowerCase();
+    const filteredSlugs = q ? Object.keys(nodes).filter(s => s.toLowerCase().includes(q) || (nodes[s].title||'').toLowerCase().includes(q)) : null;
+    const visibleLinks = q ? links.filter(l => filteredSlugs.includes(l.source) || filteredSlugs.includes(l.target)) : links;
+    // Build adjacency for tree view
+    const children = {};
+    visibleLinks.forEach(l => { (children[l.source] = children[l.source]||[]).push(l); });
+    const hasIncoming = new Set(visibleLinks.map(l => l.target));
+    const roots = Object.keys(nodes).filter(s => !hasIncoming.has(s) && (!filteredSlugs || filteredSlugs.includes(s)));
+    const orphans = Object.keys(nodes).filter(s => !children[s] && !hasIncoming.has(s) && (!filteredSlugs || filteredSlugs.includes(s)));
+    function renderNode(slug, depth, ancestors) {
+      ancestors = ancestors || new Set();
+      if (ancestors.has(slug)) return `<div style="padding:2px 8px 2px ${8+depth*16}px;font-size:11px;color:var(--muted)">↻ ${esc(slug)} (cycle)</div>`;
+      ancestors.add(slug);
+      const n = nodes[slug];
+      if (!n) return '';
+      const pad = depth * 16;
+      const ch = children[slug] || [];
+      const isFiltered = !filteredSlugs || filteredSlugs.includes(slug);
+      const dim = filteredSlugs && !isFiltered ? 'opacity:0.3' : '';
+      let html = `<div class="kb-tree-node" data-slug="${esc(slug)}" style="padding:6px 8px 6px ${8+pad}px;border-left:2px solid ${depth===0?'var(--accent)':'var(--border)'};margin:2px 0;background:var(--surface);border-radius:var(--radius-sm);cursor:pointer;${dim}">
+        <div style="display:flex;align-items:center;gap:6px"><span class="detail-badge" style="font-size:10px">${esc(n.type||'note')}</span><strong style="font-size:12px">${esc(n.title||slug)}</strong><span style="font-size:11px;color:var(--muted)">${esc(slug)}</span></div>
+        ${ch.length ? `<div style="font-size:11px;color:var(--muted);margin-top:2px">${esc(String(ch.length))} link${ch.length>1?'s':''}: ${esc(ch.map(c=>c.target).join(', '))}</div>` : ''}
+      </div>`;
+      if (depth < 8) ch.forEach(c => { html += renderNode(c.target, depth+1, new Set(ancestors)); });
+      else if (ch.length) html += `<div style="padding:2px 8px 2px ${8+(depth+1)*16}px;font-size:11px;color:var(--muted)">… +${ch.length} more (depth limit)</div>`;
+      return html;
+    }
+    const _kbShowAll = _kbFilter && _kbFilter.length > 0;
+    const _kbLimit = _kbShowAll ? roots.length : 50;
+    let treeHtml = '';
+    if (roots.length) {
+      const shown = roots.slice(0, _kbLimit);
+      shown.forEach(s => { treeHtml += renderNode(s, 0); });
+      if (roots.length > _kbLimit) treeHtml += `<div style="text-align:center;padding:8px"><button class="btn secondary small" onclick="_kbFilter='';_renderKnowledgeDetail()">Show all ${roots.length} roots</button><span style="font-size:11px;color:var(--muted);margin-left:8px">tip: filter to narrow</span></div>`;
+    } else if (filteredSlugs && filteredSlugs.length) {
+      filteredSlugs.slice(0, 50).forEach(s => { treeHtml += renderNode(s, 0); });
+    } else treeHtml = `<div class="memory-empty">No links — all docs are orphans. Switch to List view.</div>`;
+    if (orphans.length && !q) treeHtml += `<div style="margin-top:12px;padding-top:8px;border-top:1px solid var(--border)"><div style="font-size:11px;color:var(--muted);margin-bottom:6px">Orphans (${orphans.length})</div>${orphans.slice(0,30).map(s=>`<span class="detail-badge" style="margin:2px">${esc(nodes[s].title||s)}</span>`).join('')}</div>`;
+    if (dangling.length) treeHtml += `<div style="margin-top:8px;font-size:11px;color:var(--muted)">Dangling: ${esc(dangling.slice(0,10).map(d=>d.target).join(', '))}${dangling.length>10?' …':''}</div>`;
+    // SVG force graph (lightweight, no deps)
+    const svgHtml = _kbRenderSvgGraph(nodes, visibleLinks, _kbFilter);
+    contentHtml = svgHtml + `<div style="margin-top:12px">${treeHtml}</div>`;
+  } else {
+    const docs = Array.isArray(data.docs) ? data.docs : [];
+    const q = _kbFilter.toLowerCase();
+    const filtered = q ? docs.filter(d => (d.slug||'').toLowerCase().includes(q) || (d.title||'').toLowerCase().includes(q) || (d.tags||[]).join(' ').toLowerCase().includes(q)) : docs;
+    if (!filtered.length) contentHtml = `<div class="memory-empty">${q ? 'No match for "'+esc(q)+'"' : 'No knowledge docs yet.'}</div>`;
+    else contentHtml = `<div style="display:flex;flex-direction:column;gap:6px">${filtered.slice(0,200).map(d => `
+      <div class="kb-list-item" data-slug="${esc(d.slug)}" style="padding:10px 12px;border:1px solid var(--border);border-radius:var(--radius-md);background:var(--surface);display:flex;justify-content:space-between;align-items:center;gap:8px;cursor:pointer">
+        <div style="min-width:0"><div style="font-size:12px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(d.title||d.slug)}</div><div style="font-size:11px;color:var(--muted)">${esc(d.slug)}${d.source_dir?' · '+esc(d.source_dir):''}${d.tags&&d.tags.length?' · '+esc(d.tags.join(', ')):''}</div></div>
+        <span class="detail-badge">${esc(d.doc_type||'note')}</span>
+      </div>`).join('')}${filtered.length>200?`<div style="font-size:11px;color:var(--muted);text-align:center;padding:8px">+${filtered.length-200} more</div>`:''}</div>`;
+  }
+  body.innerHTML = `<div class="main-view-content">${toggleHtml}${pathHtml}${contentHtml}</div>`;
+  body.style.display = '';
+  if (empty) empty.style.display = 'none';
+  _memoryMode = 'read';
+  _setMemoryHeaderButtons('read');
+  // Bind click handlers (data-slug, not inline onclick — avoids esc breakage)
+  body.querySelectorAll('.kb-node, .kb-tree-node, .kb-list-item').forEach(el => {
+    el.addEventListener('click', () => {
+      const slug = el.getAttribute('data-slug');
+      if (slug) _kbOpenDoc(slug);
+    });
+  });
+}
+
+function _kbRenderSvgGraph(nodes, links, filter) {
+  const slugs = Object.keys(nodes);
+  if (!slugs.length) return '';
+  const q = (filter||'').toLowerCase();
+  const isMatch = s => !q || s.toLowerCase().includes(q) || (nodes[s].title||'').toLowerCase().includes(q);
+  const degree = {};
+  links.forEach(l => { degree[l.source]=(degree[l.source]||0)+1; degree[l.target]=(degree[l.target]||0)+1; });
+  let displaySlugs = slugs;
+  const MAX_NODES = 60;
+  if (slugs.length > MAX_NODES) {
+    const matched = q ? slugs.filter(isMatch) : [];
+    const sorted = [...slugs].sort((a,b) => (degree[b]||0)-(degree[a]||0));
+    const keep = new Set(matched);
+    for (const s of sorted) { if (keep.size >= MAX_NODES) break; keep.add(s); }
+    displaySlugs = [...keep];
+  }
+  const keepSet = new Set(displaySlugs);
+  const displayLinks = links.filter(l => keepSet.has(l.source) && keepSet.has(l.target));
+  const W = 600, H = 360, R = 15;
+  const pos = {};
+  displaySlugs.forEach((s, i) => {
+    const a = (i / displaySlugs.length) * Math.PI * 2 - Math.PI/2;
+    const r = Math.min(W, H) * 0.34;
+    const jitter = (i % 3 - 1) * 6;
+    pos[s] = {x: W/2 + Math.cos(a)*r + jitter, y: H/2 + Math.sin(a)*r + jitter};
+  });
+  for (let iter=0; iter<6; iter++) {
+    for (let i=0; i<displaySlugs.length; i++) for (let j=i+1; j<displaySlugs.length; j++) {
+      const a = pos[displaySlugs[i]], b = pos[displaySlugs[j]];
+      const dx=b.x-a.x, dy=b.y-a.y, d=Math.sqrt(dx*dx+dy*dy)||1;
+      if (d < R*2.2) { const push=(R*2.2-d)*0.25; const nx=dx/d*push, ny=dy/d*push; a.x-=nx/2; a.y-=ny/2; b.x+=nx/2; b.y+=ny/2; }
+    }
+  }
+  let svg = `<div style="border:1px solid var(--border);border-radius:var(--radius-md);overflow:hidden;background:var(--surface);padding:8px"><svg viewBox="0 0 ${W} ${H}" style="width:100%;height:${H}px;display:block">`;
+  displayLinks.forEach(l => {
+    const a = pos[l.source], b = pos[l.target];
+    if (!a || !b) return;
+    const dim = q && !isMatch(l.source) && !isMatch(l.target) ? 'opacity:0.06' : 'opacity:0.4';
+    svg += `<line x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}" stroke="var(--muted)" stroke-width="1" style="${dim}"/>`;
+  });
+  displaySlugs.forEach(s => {
+    const p = pos[s];
+    const match = isMatch(s);
+    const dim = q && !match ? 'opacity:0.2' : '';
+    const fill = match && q ? 'var(--accent)' : 'var(--bg)';
+    const stroke = match && q ? 'var(--accent)' : 'var(--border)';
+    const sw = match && q ? 2.5 : 1.2;
+    const title = esc(nodes[s].title||s);
+    svg += `<g class="kb-node" data-slug="${esc(s)}" style="${dim};cursor:pointer" title="${title}"><circle cx="${p.x}" cy="${p.y}" r="${R}" fill="${fill}" stroke="${stroke}" stroke-width="${sw}"/><text x="${p.x}" y="${p.y+1}" text-anchor="middle" font-size="6.5" fill="var(--text)" style="pointer-events:none">${esc(s.slice(0,9))}</text><title>${title} (${s})</title></g>`;
+  });
+  const extra = slugs.length > MAX_NODES ? ` · showing top ${displaySlugs.length} of ${slugs.length}` : '';
+  svg += `</svg><div style="font-size:11px;color:var(--muted);text-align:center;margin-top:4px">${slugs.length} nodes · ${links.length} links${extra}${q?' · filter: "'+esc(q)+'"':''} · click node to view</div></div>`;
+  return svg;
+}
+
+function _kbBindGraphClicks() {
+  // kept for compat — actual binding now inline in _renderKnowledgeDetail
+}
+
+function _kbOpenDoc(slug) {
+  // Resolve node from either graph or list data
+  let n = null;
+  let kbPath = '';
+  if (_kbGraphData && _kbGraphData.nodes && _kbGraphData.nodes[slug]) {
+    n = _kbGraphData.nodes[slug];
+    kbPath = _kbGraphData.kb_path || '';
+  } else if (_kbData && Array.isArray(_kbData.docs)) {
+    const d = _kbData.docs.find(x => x.slug === slug);
+    if (d) {
+      n = {title: d.title, type: d.doc_type, source_dir: d.source_dir, tags: d.tags};
+      kbPath = _kbData.kb_path || '';
+    }
+  }
+  // Fallback: at least show slug even if no metadata
+  if (!n) n = {title: slug, type: 'note', source_dir: '', tags: []};
+  if (!kbPath) kbPath = (_kbGraphData && _kbGraphData.kb_path) || (_kbData && _kbData.kb_path) || '';
+  const body = $('memoryDetailBody');
+  if (!body) return;
+  const filePath = kbPath ? `${kbPath}/${slug}.md` : slug;
+  // Show quick preview card
+  const detailHtml = `<div class="main-view-content">
+    <button class="btn secondary small" onclick="_renderKnowledgeDetail()" style="margin-bottom:12px">${li('arrow-left',14)} Back to Knowledge</button>
+    <div style="padding:12px 14px;border:1px solid var(--border);border-radius:var(--radius-md);background:var(--surface);margin-bottom:12px">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px"><span class="detail-badge">${esc(n.type||'note')}</span><strong>${esc(n.title||slug)}</strong></div>
+      <div style="font-size:11px;color:var(--muted)">${esc(slug)}${n.source_dir?' · '+esc(n.source_dir):''}${n.tags&&n.tags.length?' · '+esc(n.tags.join(', ')):''}</div>
+      <div style="font-size:11px;color:var(--muted);margin-top:4px">${esc(filePath)}</div>
+    </div>
+    <div id="kb-doc-content" style="padding:12px;border:1px solid var(--border);border-radius:var(--radius-md);background:var(--bg);min-height:120px"><div style="font-size:12px;color:var(--muted)">Loading…</div></div>
+  </div>`;
+  body.innerHTML = detailHtml;
+  // Try to load doc content via workspace read
+  _kbLoadDocContent(slug, filePath);
+}
+
+async function _kbLoadDocContent(slug, filePath) {
+  const el = document.getElementById('kb-doc-content');
+  if (!el) return;
+  try {
+    // Try reading via workspace file API
+    const data = await api(`/api/workspace/read?path=${encodeURIComponent(filePath)}`);
+    const content = data && (data.content || data.text || '') || '';
+    if (content) el.innerHTML = `<div class="memory-content preview-md">${renderMd(content.slice(0, 8000))}</div>`;
+    else el.innerHTML = `<div style="font-size:12px;color:var(--muted)">Empty file.</div>`;
+  } catch(e) {
+    el.innerHTML = `<div style="font-size:12px;color:var(--muted)">Preview not available. File: ${esc(filePath)}<br>${esc(e.message||String(e))}</div>`;
+  }
+}
+
+function _kbSwitchView(v) {
+  _kbView = v;
+  // Keep other view's cache — _kbOpenDoc needs both
+  if (v === 'graph') _kbGraphData = null; else _kbData = null;
+  _loadKnowledge(v).then(() => _renderKnowledgeDetail());
+}
+function _kbSwitchProfile(p) {
+  _kbProfile = p;
+  _kbData = null; _kbGraphData = null;
+  _loadKnowledge(_kbView, p).then(() => _renderKnowledgeDetail());
+}
+
 async function openMemorySection(section, el) {
   if (section === 'external_notes' && _memoryData && !_memoryData.external_notes_enabled) return;
   _currentMemorySection = section;
@@ -5554,7 +6044,7 @@ async function openMemorySection(section, el) {
 
 function editCurrentMemory() {
   const meta = _memorySectionMeta(_currentMemorySection);
-  if (!_currentMemorySection || _currentMemorySection === 'external_notes' || meta.readOnly) return;
+  if (!_currentMemorySection || _currentMemorySection === 'external_notes' || _currentMemorySection === 'knowledge' || meta.readOnly) return;
   _renderMemoryEdit(_currentMemorySection);
 }
 
@@ -5863,11 +6353,20 @@ function renderWorkspaceDropdownInto(dd, workspaces, currentWs){
     listContainer.innerHTML='';
     for(const w of sorted){
       const opt=document.createElement('div');
-      opt.className='ws-opt'+(w.path===currentWs?' active':'');
+      const isActive=w.path===currentWs;
+      opt.className='ws-opt'+(isActive?' active':'');
       opt.dataset.name=w.name||'';
       opt.dataset.path=w.path||'';
-      opt.innerHTML=`<span class="ws-opt-name">${esc(w.name)}</span><span class="ws-opt-path">${esc(w.path)}</span>`;
+      const dot=(typeof _wsStatusDot==='function'?_wsStatusDot(w.path):'');
+      const badge=isActive?` <span class="shadcn-combobox-badge" style="margin-left:6px">ACTIVE</span>`:'';
+      const check=isActive?`<span class="shadcn-combobox-check" style="margin-left:auto">${li('check',12)}</span>`:'';
+      opt.style.cssText='display:flex;align-items:center;justify-content:space-between;gap:8px;';
+      opt.innerHTML=`<span style="display:flex;flex-direction:column;gap:2px;min-width:0;flex:1"><span class="ws-opt-name" style="display:flex;align-items:center">${dot}${esc(w.name)}${badge}</span><span class="ws-opt-path">${esc(w.path)}</span></span>${check}`;
+      opt.setAttribute('role','option');
+      opt.setAttribute('aria-selected',isActive?'true':'false');
+      opt.tabIndex=0;
       opt.onclick=()=>switchToWorkspace(w.path,w.name);
+      opt.onkeydown=(e)=>{ if(e.key==='Enter'||e.key===' '){ e.preventDefault(); switchToWorkspace(w.path,w.name); } };
       listContainer.appendChild(opt);
     }
     listContainer.appendChild(noResults);
@@ -5990,6 +6489,7 @@ async function loadWorkspacesPanel(){
   if(!panel)return;
   const data=await loadWorkspaceList();
   renderWorkspacesPanel(data.workspaces);
+  _refreshWorkspaceHealth(false);
 }
 
 function renderWorkspacesPanel(workspaces){
@@ -6004,10 +6504,15 @@ function renderWorkspacesPanel(workspaces){
     row.draggable=true;
     const isActive = w.path === activePath;
     const activeBadge = isActive ? `<span class="detail-badge active" style="margin-left:6px;font-size:9px;padding:1px 6px">${esc(t('profile_active'))}</span>` : '';
+    const h = _wsHealthFor(w.path);
+    const offline = h && h.reachable === false;
+    if(offline) row.classList.add('ws-offline');
+    const kindLabel = _wsClassify(w.path)==='local' ? 'Local' : _wsClassify(w.path)==='remote-mac' ? 'Mac' : _wsClassify(w.path)==='remote-win' ? 'Win' : '';
+    const kindMini = kindLabel ? `<span class="ws-kind-mini ${h&&h.reachable===false?'offline':''}">${esc(kindLabel)}</span>` : '';
     row.innerHTML=`
       <span class="ws-drag-handle" title="${esc(t('workspace_drag_hint'))}">${li('grip-vertical',12)}</span>
       <div class="ws-row-info">
-        <div class="ws-row-name">${esc(w.name)}${activeBadge}</div>
+        <div class="ws-row-name">${_wsStatusDot(w.path)}${esc(w.name)}${kindMini}${activeBadge}</div>
         <div class="ws-row-path">${esc(w.path)}</div>
       </div>`;
     // Click on info area only — not on drag handle
@@ -6080,6 +6585,66 @@ function renderWorkspacesPanel(workspaces){
   }
 }
 
+// ── Workspace status dot helper ──
+let _wsHealthMap = {}; // path -> {kind, reachable, latency_ms}
+function _wsClassify(path){
+  if(!path) return 'unknown';
+  if(path.startsWith('/home/')) return 'local';
+  if(path.startsWith('/Users/')) return 'remote-mac';
+  if(path.startsWith('/c/') || path.startsWith('/d/') || path.startsWith('/C:') || path.startsWith('/D:')) return 'remote-win';
+  return 'unknown';
+}
+function _wsHealthFor(path){ return _wsHealthMap[path] || null; }
+function _wsStatusDot(path){
+  const h = _wsHealthFor(path);
+  const kind = h ? h.kind : _wsClassify(path);
+  if(kind === 'local') return '<span class="ws-status-dot local" title="Local — on this server"></span>';
+  if(kind === 'remote-mac' || kind === 'remote-win'){
+    if(h && h.reachable === true){
+      const ms = h.latency_ms != null ? ` · ${h.latency_ms}ms` : '';
+      return `<span class="ws-status-dot remote reachable" title="Remote — online${ms}"></span>`;
+    }
+    if(h && h.reachable === false) return '<span class="ws-status-dot remote offline" title="Remote — offline / unreachable"></span>';
+    return '<span class="ws-status-dot remote" title="Remote — checking..."></span>';
+  }
+  return '<span class="ws-status-dot unknown" title="Unknown location"></span>';
+}
+function _wsKindBadge(path){
+  const h = _wsHealthFor(path);
+  const kind = h ? h.kind : _wsClassify(path);
+  if(kind === 'local') return '<span class="detail-badge local-badge" title="Runs on this VPS">Local VPS</span>';
+  if(kind === 'remote-mac') return '<span class="detail-badge remote-badge">Remote · Mac</span>';
+  if(kind === 'remote-win') return '<span class="detail-badge remote-badge">Remote · Windows</span>';
+  return '<span class="detail-badge">Unknown</span>';
+}
+function _wsReachabilityBadge(path){
+  const h = _wsHealthFor(path);
+  if(!h) return '<span class="detail-badge" style="opacity:.6">Checking…</span>';
+  if(h.kind === 'local') return '<span class="detail-badge reachable">● Online</span>';
+  if(h.reachable === true){
+    const ms = h.latency_ms != null ? ` · ${h.latency_ms}ms` : '';
+    return `<span class="detail-badge reachable">● Online${ms}</span>`;
+  }
+  if(h.reachable === false) return '<span class="detail-badge offline">○ Offline</span>';
+  return '<span class="detail-badge" style="opacity:.6">Checking…</span>';
+}
+async function _refreshWorkspaceHealth(force=false){
+  try{
+    const qs = force ? '?force=1' : '';
+    const data = await api('/api/workspaces/health' + qs);
+    const wss = _workspaceList || [];
+    const health = data.health || [];
+    _wsHealthMap = {};
+    for(let i=0;i<wss.length;i++) _wsHealthMap[wss[i].path] = health[i] || {kind:_wsClassify(wss[i].path),reachable:null,latency_ms:null};
+    // Re-render visible UI without full reload
+    if(_currentPanel === 'workspaces'){
+      const panel = document.getElementById('workspacesPanel');
+      if(panel) renderWorkspacesPanel(wss);
+      if(_currentWorkspaceDetail) _renderWorkspaceDetail(_currentWorkspaceDetail);
+    }
+  }catch(_){}
+}
+
 function _renderWorkspaceDetail(ws){
   _currentWorkspaceDetail = ws;
   const title = $('workspaceDetailTitle');
@@ -6094,13 +6659,29 @@ function _renderWorkspaceDetail(ws){
     ? `<span class="detail-badge active">${esc(t('profile_active'))}</span>`
     : `<span class="detail-badge">Inactive</span>`;
   const defaultBadge = isDefault ? ` <span class="detail-badge">${esc(t('profile_default_label'))}</span>` : '';
+  const kindBadge = _wsKindBadge(ws.path);
+  const reachBadge = _wsReachabilityBadge(ws.path);
+  const pingBtn = `<button class="btn btn-sm" onclick="_refreshWorkspaceHealth(true)" title="Ping remote hosts via Tailscale" style="margin-left:6px">${li('refresh-cw',12)} Ping</button>`;
   body.innerHTML = `
     <div class="main-view-content">
       <div class="detail-card">
         <div class="detail-card-title">Space</div>
-        <div class="detail-row"><div class="detail-row-label">Name</div><div class="detail-row-value">${esc(ws.name || '')}</div></div>
+        <div class="detail-row"><div class="detail-row-label">Name</div><div class="detail-row-value">${_wsStatusDot(ws.path)}${esc(ws.name || '')}</div></div>
         <div class="detail-row"><div class="detail-row-label">Path</div><div class="detail-row-value"><code>${esc(ws.path)}</code></div></div>
+        <div class="detail-row"><div class="detail-row-label">Location</div><div class="detail-row-value">${kindBadge}</div></div>
+        <div class="detail-row"><div class="detail-row-label">Reachability</div><div class="detail-row-value">${reachBadge}${pingBtn}</div></div>
         <div class="detail-row"><div class="detail-row-label">Status</div><div class="detail-row-value">${statusBadge}${defaultBadge}</div></div>
+      </div>
+      <div class="detail-card" style="margin-top:12px" id="filemapCard">
+        <div class="detail-card-title" style="display:flex;align-items:center;justify-content:space-between;gap:8px">
+          <span>Filemap <span id="filemapMeta" style="font-weight:400;color:var(--muted);font-size:11px"></span></span>
+          <span style="display:flex;gap:6px;align-items:center">
+            <button class="btn btn-sm" onclick="_refreshFilemap(true)" title="Regenerate filemap">${li('refresh-cw',12)} Refresh</button>
+          </span>
+        </div>
+        <div id="filemapContainer" style="margin-top:8px">
+          <div style="color:var(--muted);font-size:12px;padding:8px 0">Loading filemap…</div>
+        </div>
       </div>
       <div class="detail-card" style="margin-top:12px">
         <div class="detail-card-title">${esc(t('checkpoint_title'))}</div>
@@ -6114,6 +6695,7 @@ function _renderWorkspaceDetail(ws){
   _workspaceMode = 'read';
   _setWorkspaceHeaderButtons('read', ws);
   _loadCheckpoints(ws.path);
+  _loadFilemap(ws.path);
 }
 
 function _setWorkspaceHeaderButtons(mode, ws){
@@ -6766,17 +7348,43 @@ function _renderProfileDetail(p, activeName){
   rows.push(`<div class="detail-row"><div class="detail-row-label">API key</div><div class="detail-row-value">${p.has_env ? esc(t('profile_api_keys_configured')) : '<span style="color:var(--muted)">Not configured</span>'}</div></div>`);
   if (p.total_skills && p.total_skills > 0) rows.push(`<div class="detail-row"><div class="detail-row-label">Skills</div><div class="detail-row-value">${esc(t('profile_skill_count', p.total_skills).replace(String(p.total_skills), `${p.enabled_skills} / ${p.total_skills}`))}</div></div>`);
   if (p.default_workspace) rows.push(`<div class="detail-row"><div class="detail-row-label">Default space</div><div class="detail-row-value"><code>${esc(p.default_workspace)}</code></div></div>`);
+  // ── Evonic-style: per-agent personality + SOUL.md + per-profile skills ──
+  const detailId = `profile-detail-${CSS.escape(p.name)}`;
   body.innerHTML = `
     <div class="main-view-content">
       <div class="detail-card">
         <div class="detail-card-title">Profile</div>
         ${rows.join('')}
       </div>
+      <div class="detail-card" id="${detailId}-persona">
+        <div class="detail-card-title" style="display:flex;align-items:center;justify-content:space-between;gap:8px">
+          <span style="display:flex;align-items:center;gap:6px">${li('sparkles',14)} ${esc(t('profile_persona_title'))}</span>
+          <button class="btn secondary small" onclick="openProfilePersonaEditor('${esc(p.name)}')" title="${esc(t('profile_persona_edit'))}">${li('pencil',12)} ${esc(t('profile_persona_edit'))}</button>
+        </div>
+        <div id="${detailId}-soul-preview" style="max-height:180px;overflow-y:auto;white-space:pre-wrap;word-break:break-word;font-size:12.5px;line-height:1.6;color:var(--muted);border:1px solid var(--border);border-radius:8px;padding:10px;background:var(--surface)">${esc(t('loading'))}</div>
+        <div style="margin-top:10px;display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+          <label for="${detailId}-personality" style="font-size:11px;font-weight:600;letter-spacing:0.04em;text-transform:uppercase;color:var(--muted)">${esc(t('profile_personality_label'))}</label>
+          <select id="${detailId}-personality" style="flex:1;min-width:160px" onchange="setProfilePersonality('${esc(p.name)}', this.value)">
+            <option value="">${esc(t('profile_personality_none'))}</option>
+          </select>
+        </div>
+        <div class="detail-form-hint">${esc(t('profile_persona_hint'))}</div>
+      </div>
+      <div class="detail-card" id="${detailId}-skills">
+        <div class="detail-card-title" style="display:flex;align-items:center;justify-content:space-between;gap:8px">
+          <span style="display:flex;align-items:center;gap:6px">${li('blocks',14)} ${esc(t('profile_skills_title'))}</span>
+          <button class="btn secondary small" onclick="openProfileSkillsEditor('${esc(p.name)}')">${li('settings',12)} ${esc(t('manage') || 'Manage')}</button>
+        </div>
+        <div id="${detailId}-skills-list" style="font-size:12px;color:var(--muted)">${esc(t('loading'))}</div>
+      </div>
     </div>`;
   body.style.display = '';
   if (empty) empty.style.display = 'none';
   _profileMode = 'read';
   _setProfileHeaderButtons('read', p, activeName);
+  // Async hydrate: SOUL.md + personalities + skills (per-profile, no extra nav)
+  _loadProfilePersona(p.name, detailId);
+  _loadProfileSkills(p.name, detailId);
 }
 
 function _setProfileHeaderButtons(mode, p, activeName){
@@ -6819,6 +7427,177 @@ function openProfileDetail(name, el){
   _profilePreFormDetail = null;
   _renderProfileDetail(p, _profilesCache.active);
   _closeMobileSidebarAfterPanelSelection();
+}
+
+// ── Evonic-style per-agent persona + skills (profile detail) ──
+const _PROFILE_PERSONA_PRESETS = {
+  '': { label: 'None (use SOUL.md)', hint: '' },
+  'frontend': { label: 'Frontend Specialist', hint: 'React/Next.js, Tailwind, shadcn — code-first, minimal chat' },
+  'backend': { label: 'Backend Specialist', hint: 'API, DB, infra — concise, security-aware' },
+  'reviewer': { label: 'Code Reviewer', hint: 'Strict review, suggest fixes, no auto-merge' },
+  'writer': { label: 'Writer / Docs', hint: 'Clear docs, blog, technical writing' },
+  'assistant': { label: 'General Assistant', hint: 'Helpful, friendly, broad' },
+};
+
+async function _loadProfilePersona(profileName, detailId){
+  const preview = document.getElementById(`${detailId}-soul-preview`);
+  const sel = document.getElementById(`${detailId}-personality`);
+  if (!preview && !sel) return;
+  try {
+    const mem = await api(`/api/memory?profile=${encodeURIComponent(profileName)}`);
+    if (preview) {
+      const soul = (mem && mem.soul) ? String(mem.soul) : '';
+      const isActiveProfile = _currentProfileDetail && _currentProfileDetail.name === (_profilesCache && _profilesCache.active);
+      if (soul) {
+        preview.textContent = soul.slice(0, 1400) + (soul.length > 1400 ? '\n…' : '');
+        preview.style.color = 'var(--text)';
+      } else {
+        preview.textContent = t('no_soul_yet') || 'No persona yet — click Edit to create SOUL.md.';
+        preview.style.color = 'var(--muted)';
+      }
+      if (!isActiveProfile) {
+        const hint = document.createElement('div');
+        hint.style.cssText = 'margin-top:6px;font-size:11px;color:var(--muted)';
+        hint.textContent = t('profile_persona_inactive_hint');
+        preview.parentElement.appendChild(hint);
+      }
+      // Inline quick-edit for active profile
+      if (isActiveProfile) {
+        const actions = document.createElement('div');
+        actions.style.cssText = 'margin-top:6px;display:flex;gap:6px';
+        actions.innerHTML = `<button class="btn secondary small" onclick="openProfilePersonaInlineEditor('${esc(profileName)}','${detailId}')">${li('pencil',10)} Quick edit</button><button class="btn secondary small" onclick="openProfilePresetPicker('${esc(profileName)}','${detailId}')">${li('sparkles',10)} Presets</button>`;
+        preview.parentElement.appendChild(actions);
+      }
+    }
+    if (sel) {
+      try {
+        const cfg = await api('/api/config');
+        const pers = (cfg && cfg.agent && cfg.agent.personalities) || {};
+        const names = Object.keys(pers).sort();
+        for (const n of names) {
+          const opt = document.createElement('option');
+          opt.value = n;
+          opt.textContent = n;
+          sel.appendChild(opt);
+        }
+        // Also add Evonic-style preset shortcuts
+        for (const [k, v] of Object.entries(_PROFILE_PERSONA_PRESETS)) {
+          if (k && !names.includes(k)) {
+            const opt = document.createElement('option');
+            opt.value = `preset:${k}`;
+            opt.textContent = `★ ${v.label}`;
+            sel.appendChild(opt);
+          }
+        }
+      } catch(_){}
+    }
+  } catch(e) {
+    if (preview) preview.textContent = (t('load_failed') || 'Failed to load') + ': ' + (e.message || e);
+  }
+}
+
+async function _loadProfileSkills(profileName, detailId){
+  const el = document.getElementById(`${detailId}-skills-list`);
+  if (!el) return;
+  try {
+    const data = await api(`/api/skills?profile=${encodeURIComponent(profileName)}`);
+    const skills = Array.isArray(data && data.skills) ? data.skills : [];
+    if (!skills.length) { el.textContent = t('no_skills') || 'No skills installed.'; return; }
+    const enabled = skills.filter(s => !s.disabled);
+    const isActiveProfile = _currentProfileDetail && _currentProfileDetail.name === (_profilesCache && _profilesCache.active);
+    let html = `<div style="display:flex;flex-wrap:wrap;gap:4px">${enabled.slice(0, 28).map(s => `<span class="detail-badge" title="${esc(s.description || s.name)}">${esc(s.name)}</span>`).join('')}${enabled.length > 28 ? `<span class="detail-badge">+${enabled.length - 28} more</span>` : ''}</div><div style="margin-top:6px;color:var(--muted)">${esc(String(enabled.length))} / ${esc(String(skills.length))} enabled</div>`;
+    if (!isActiveProfile) html += `<div style="margin-top:6px;font-size:11px;color:var(--muted)">${esc(t('profile_skills_inactive_hint'))}</div>`;
+    el.innerHTML = html;
+  } catch(e) {
+    el.textContent = t('load_failed') + ': ' + (e.message || e);
+  }
+}
+
+function openProfilePersonaEditor(profileName){
+  if (typeof switchPanel === 'function') switchPanel('memory');
+  setTimeout(async () => {
+    try { await loadMemory(true); } catch(_){}
+    const soulTab = document.querySelector('[data-memory-section="soul"]');
+    if (soulTab) soulTab.click();
+    const ed = document.querySelector('[data-memory-editor="soul"] textarea, #memorySoulEditor');
+    if (ed) { ed.focus(); ed.scrollIntoView({block:'center'}); }
+  }, 300);
+}
+
+function openProfilePersonaInlineEditor(profileName, detailId){
+  const preview = document.getElementById(`${detailId}-soul-preview`);
+  if (!preview) return;
+  const current = preview.textContent || '';
+  const isEmpty = !current || current.includes('No persona yet');
+  preview.innerHTML = `<textarea id="${detailId}-soul-editor" style="width:100%;min-height:160px;font-family:monospace;font-size:12px;line-height:1.5;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--surface);color:var(--text);resize:vertical" placeholder="Write SOUL.md for ${esc(profileName)}…">${esc(isEmpty ? '' : current)}</textarea><div style="margin-top:6px;display:flex;gap:6px"><button class="btn primary small" onclick="saveProfileSoulInline('${esc(profileName)}','${detailId}')">${esc(t('save') || 'Save')}</button><button class="btn secondary small" onclick="_loadProfilePersona('${esc(profileName)}','${detailId}')">${esc(t('cancel') || 'Cancel')}</button></div>`;
+  const ta = document.getElementById(`${detailId}-soul-editor`);
+  if (ta) ta.focus();
+}
+
+async function saveProfileSoulInline(profileName, detailId){
+  const ta = document.getElementById(`${detailId}-soul-editor`);
+  if (!ta) return;
+  const content = ta.value;
+  try {
+    await api('/api/memory', {method:'POST', body: JSON.stringify({section:'soul', content})});
+    showToast(t('profile_soul_saved') || 'Persona saved');
+    _loadProfilePersona(profileName, detailId);
+  } catch(e) { showToast((t('save_failed') || 'Save failed: ') + (e.message || e), 'error'); }
+}
+
+function openProfilePresetPicker(profileName, detailId){
+  const presets = Object.entries(_PROFILE_PERSONA_PRESETS).filter(([k]) => k).map(([k,v]) => `<button class="btn secondary small" style="justify-content:flex-start;text-align:left;white-space:normal" onclick="applyProfilePreset('${esc(profileName)}','${esc(k)}','${detailId}')"><strong>${esc(v.label)}</strong><br><span style="font-size:11px;color:var(--muted)">${esc(v.hint)}</span></button>`).join('');
+  const preview = document.getElementById(`${detailId}-soul-preview`);
+  if (!preview) return;
+  const box = document.createElement('div');
+  box.id = `${detailId}-preset-box`;
+  box.style.cssText = 'margin-top:8px;display:flex;flex-direction:column;gap:6px;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--surface)';
+  box.innerHTML = `<div style="font-size:12px;font-weight:600">${esc(t('profile_preset_title') || 'Apply preset (overwrites SOUL.md)')}</div>${presets}<button class="btn secondary small" onclick="document.getElementById('${detailId}-preset-box')?.remove()">${esc(t('cancel') || 'Cancel')}</button>`;
+  preview.parentElement.appendChild(box);
+}
+
+async function applyProfilePreset(profileName, presetKey, detailId){
+  const preset = _PROFILE_PERSONA_PRESETS[presetKey];
+  if (!preset) return;
+  const templates = {
+    frontend: `You are ${profileName}, Frontend Specialist. Build production React/Next.js + Tailwind + shadcn UI. Prefer TanStack Query/Router/Table. Keep components in features/[route]/sections/. Code-first, concise.`,
+    backend: `You are ${profileName}, Backend Specialist. Design APIs, DB schemas, and infra. Validate at trust boundaries, handle errors without data loss. Security-first.`,
+    reviewer: `You are ${profileName}, Code Reviewer. Review diffs strictly: correctness, security, perf, a11y. Suggest minimal fixes. Never auto-merge without approval.`,
+    writer: `You are ${profileName}, Writer. Produce clear technical docs, blog posts, and release notes. Structure with headings, examples, and concise summaries.`,
+    assistant: `You are ${profileName}, helpful assistant for Adit. Be concise, proactive, verify before claiming done. Mix Indo+English casual (gw/lu) when appropriate.`,
+  };
+  const content = templates[presetKey] || preset.label;
+  if (!confirm((t('profile_preset_confirm') || 'Overwrite SOUL.md with preset?') + `\n\n${content.slice(0, 200)}`)) return;
+  try {
+    await api('/api/memory', {method:'POST', body: JSON.stringify({section:'soul', content})});
+    showToast(t('profile_soul_saved') || 'Persona saved');
+    document.getElementById(`${detailId}-preset-box`)?.remove();
+    _loadProfilePersona(profileName, detailId);
+  } catch(e) { showToast((t('save_failed') || 'Save failed: ') + (e.message || e), 'error'); }
+}
+
+function openProfileSkillsEditor(profileName){
+  if (typeof switchPanel === 'function') switchPanel('skills');
+  setTimeout(async () => { try { await loadSkills(); } catch(_){} }, 200);
+}
+
+async function setProfilePersonality(profileName, personalityName){
+  try {
+    // Personality is per-session via /personality — we set it for the active profile's next turn
+    // If profile not active, activate first
+    const active = _profilesCache && _profilesCache.active;
+    if (profileName !== active) {
+      await switchToProfile(profileName);
+      await loadProfilesPanel();
+    }
+    if (!personalityName) {
+      await api('/api/personality/clear', {method:'POST'});
+      showToast(t('personality_cleared') || 'Personality cleared');
+    } else {
+      await api('/api/personality/set', {method:'POST', body: JSON.stringify({name: personalityName})});
+      showToast((t('personality_set') || 'Personality: ') + personalityName);
+    }
+  } catch(e) { showToast((t('personality_set_failed') || 'Failed: ') + (e.message || e), 'error'); }
 }
 
 function _clearProfileDetail(){
@@ -13335,6 +14114,160 @@ switchSettingsSection=function(name, opts){
   if(name==='system'){loadMcpServers();loadMcpTools();loadGatewayStatus();}
 };
 
+// ── Filemap ───────────────────────────────────────────────────────────────
+
+let _filemapCache = null; // {path, data}
+let _filemapFilter = '';
+
+async function _loadFilemap(workspace){
+  const container=$('filemapContainer');
+  const meta=$('filemapMeta');
+  if(!container) return;
+  container.innerHTML=`<div style="color:var(--muted);font-size:12px;padding:8px 0">Loading filemap…</div>`;
+  if(meta) meta.textContent='';
+  try{
+    const data=await api(`/api/workspaces/filemap?path=${encodeURIComponent(workspace)}`);
+    if(data.filemap===null){
+      container.innerHTML=`<div style="color:var(--muted);font-size:12px;padding:8px 0">${esc(data.reason||'No filemap found.')} <code style="font-size:11px">python3 ~/.hermes/scripts/filemap.py</code></div>`;
+      _filemapCache=null;
+      return;
+    }
+    _filemapCache={path:workspace, data:data.filemap};
+    _filemapFilter='';
+    _renderFilemap(data.filemap);
+  }catch(e){
+    // Remote or blocked — muted, not red
+    if(e.message && (e.message.includes('not found')||e.message.includes('blocked')||e.message.includes('Remote'))){
+      container.innerHTML=`<div style="color:var(--muted);font-size:12px;padding:8px 0;display:flex;align-items:center;gap:6px"><span class="ws-status-dot remote" style="margin:0"></span>Filemap not available for this workspace.</div>`;
+    } else {
+      container.innerHTML=`<div style="color:var(--error,#f87171);font-size:12px;padding:8px 0">Filemap error: ${esc(e.message)}</div>`;
+    }
+    _filemapCache=null;
+  }
+}
+
+async function _refreshFilemap(force){
+  if(!_currentWorkspaceDetail) return;
+  const ws=_currentWorkspaceDetail.path;
+  if(force){
+    const c=$('filemapContainer');
+    if(c) c.innerHTML=`<div style="color:var(--muted);font-size:12px;padding:8px 0">Regenerating…</div>`;
+    try{ await api(`/api/workspaces/filemap?path=${encodeURIComponent(ws)}`); }catch(_){}
+    // Try to regen via terminal if available, else just reload
+    try{
+      await fetch(`/api/terminal/start`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({command:`python3 ~/.hermes/scripts/filemap.py "${ws}" --force 2>&1 | tail -5`})});
+    }catch(_){}
+    // Small delay then reload
+    setTimeout(()=>_loadFilemap(ws), 1200);
+    return;
+  }
+  _loadFilemap(ws);
+}
+
+function _renderFilemap(fm){
+  const container=$('filemapContainer');
+  const meta=$('filemapMeta');
+  if(!container||!fm) return;
+  const total=fm.total_files|| (fm.files?fm.files.length:0);
+  const gen=fm.generated? new Date(fm.generated).toLocaleString() : '';
+  const commit=fm.commit? ` · <code style="font-size:10px">${esc(fm.commit)}</code>` : '';
+  if(meta) meta.innerHTML=`${total} files${gen?` · ${esc(gen)}`:''}${commit}`;
+  const files=fm.files||[];
+  // Filter
+  const q=(_filemapFilter||'').toLowerCase().trim();
+  let shown=files;
+  if(q){
+    shown=files.filter(f=>{
+      const p=(f.path||'').toLowerCase();
+      const s=(f.summary||'').toLowerCase();
+      return p.includes(q)||s.includes(q);
+    });
+  }
+  const MAX=200;
+  const slice=shown.slice(0,MAX);
+  const more=shown.length>MAX? `<div style="color:var(--muted);font-size:11px;padding:6px 0">+ ${shown.length-MAX} more — refine search to see them</div>` : '';
+  const countLine=`<div style="font-size:11px;color:var(--muted);margin-bottom:6px">${shown.length} / ${total} files${q?` · filter: "${esc(q)}"`:''}</div>`;
+  const searchHtml=`<div style="display:flex;gap:6px;margin-bottom:8px"><input id="filemapSearch" type="search" placeholder="Search path or summary…" value="${esc(_filemapFilter)}" oninput="_filemapFilter=this.value;_renderFilemapList(_filemapCache.data)" style="flex:1;padding:6px 8px;border-radius:6px;border:1px solid var(--border,rgba(255,255,255,0.12));background:var(--bg2,rgba(255,255,255,0.04));color:var(--fg);font-size:12px" autocomplete="off"><button class="btn btn-sm" onclick="document.getElementById('filemapSearch').value='';_filemapFilter='';_renderFilemapList(_filemapCache.data)">Clear</button></div>`;
+  // Tree toggle
+  const treeHtml=_renderFilemapTree(fm.tree, shown);
+  let listHtml='';
+  if(!slice.length){
+    listHtml=`<div style="color:var(--muted);font-size:12px;padding:8px 0">No files match.</div>`;
+  } else {
+    listHtml=slice.map(f=>{
+      const sz=f.size!=null? `<span style="color:var(--muted);font-size:10px;margin-left:6px">${_fmtBytes(f.size)}</span>` : '';
+      const sum=f.summary? `<div style="font-size:11px;color:var(--muted);margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(f.summary)}">${esc(f.summary)}</div>` : '';
+      return `<div class="detail-row" style="flex-direction:column;align-items:stretch;padding:6px 0;border-bottom:1px solid var(--border,rgba(255,255,255,0.06));cursor:pointer" onclick="_filemapOpen('${esc(f.path).replace(/'/g,"\\'")}')">
+        <div style="display:flex;align-items:center;gap:6px"><code style="font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1">${esc(f.path)}</code>${sz}</div>${sum}</div>`;
+    }).join('');
+  }
+  container.innerHTML=searchHtml+countLine+treeHtml+listHtml+more;
+  // Keep focus on search input after re-render
+  const inp=document.getElementById('filemapSearch');
+  if(inp && document.activeElement!==inp && _filemapFilter) { /* don't steal focus */ }
+  // Re-focus if user was typing
+  if(inp && _filemapFilter){
+    const v=inp.value;
+    // restore cursor at end — re-render loses focus, so refocus
+    setTimeout(()=>{ const el=document.getElementById('filemapSearch'); if(el){ el.focus(); el.setSelectionRange(v.length,v.length); } },0);
+  }
+}
+
+function _renderFilemapList(fm){
+  // Lightweight re-render for search filtering — reuse _renderFilemap but avoid full tree rebuild flicker
+  _renderFilemap(fm);
+  // Focus is handled in _renderFilemap
+}
+
+function _fmtBytes(n){
+  if(n==null) return '';
+  if(n<1024) return n+' B';
+  if(n<1024*1024) return (n/1024).toFixed(1)+' KB';
+  return (n/1024/1024).toFixed(1)+' MB';
+}
+
+function _renderFilemapTree(tree, filteredFiles){
+  if(!tree||typeof tree!=='object') return '';
+  // Build set of filtered paths for dimming
+  const filteredSet=new Set((filteredFiles||[]).map(f=>f.path));
+  const hasFilter=filteredSet.size>0 && filteredFiles.length < (filteredFiles.length||0) + 1; // always show tree
+  // Actually just render top-level dirs collapsed by default
+  let html=`<details style="margin-bottom:8px"><summary style="cursor:pointer;font-size:12px;color:var(--muted)">Tree</summary><div style="font-family:monospace;font-size:11px;line-height:1.5;margin-top:6px;max-height:240px;overflow:auto;border:1px solid var(--border,rgba(255,255,255,0.08));border-radius:6px;padding:8px;background:var(--bg2,rgba(255,255,255,0.03))">`;
+  function walk(node, prefix){
+    const keys=Object.keys(node).sort((a,b)=>{
+      const da=node[a]!==null && typeof node[a]==='object';
+      const db=node[b]!==null && typeof node[b]==='object';
+      if(da!==db) return da? -1:1;
+      return a.localeCompare(b);
+    });
+    for(const k of keys){
+      const v=node[k];
+      const full=prefix? prefix+'/'+k : k;
+      const isDir=v!==null && typeof v==='object';
+      const icon=isDir? '📁 ' : '📄 ';
+      // dim if filtered and not in set (only for files)
+      let dim='';
+      if(_filemapFilter && !isDir && !filteredSet.has(full)) dim=' style="opacity:0.35"';
+      html+=`<div${dim}>${esc(prefix.replace(/[^/]/g,'·').replace(/\//g,'  '))}${icon}${esc(k)}${isDir?' /':''}</div>`;
+      if(isDir) walk(v, full);
+    }
+  }
+  walk(tree, '');
+  html+=`</div></details>`;
+  return html;
+}
+
+function _filemapOpen(relPath){
+  if(!_currentWorkspaceDetail) return;
+  const ws=_currentWorkspaceDetail.path;
+  // Try to open via workspace file preview if session exists, else just copy path
+  const full=ws.replace(/\/$/,'')+'/'+relPath;
+  if(navigator.clipboard) navigator.clipboard.writeText(full).catch(()=>{});
+  showToast(`Path copied: ${relPath}`);
+  // If there's an active session on this workspace, try to trigger file open via chat hint
+  // (actual file open is via /api/list + preview — keep it simple: copy + toast)
+}
+
 // ── Checkpoints / Rollback ──────────────────────────────────────────────────
 
 async function _loadCheckpoints(workspace){
@@ -13342,6 +14275,11 @@ async function _loadCheckpoints(workspace){
   if(!container) return;
   try{
     const data=await api(`/api/rollback/list?workspace=${encodeURIComponent(workspace)}`);
+    // Remote workspace — show muted hint instead of error
+    if(data.remote){
+      container.innerHTML=`<div style="color:var(--muted);font-size:12px;padding:8px 0;display:flex;align-items:center;gap:6px"><span class="ws-status-dot remote" style="margin:0"></span>${esc(data.remote_hint||'Checkpoints live on the remote host.')}</div>`;
+      return;
+    }
     const checkpoints=data.checkpoints||[];
     if(!checkpoints.length){
       container.innerHTML=`<div style="color:var(--muted);font-size:12px;padding:8px 0">${esc(t('checkpoint_empty'))}</div>`;
@@ -13375,7 +14313,12 @@ async function _loadCheckpoints(workspace){
     }
     container.innerHTML=html;
   }catch(e){
-    container.innerHTML=`<div style="color:var(--error,#f87171);font-size:12px;padding:8px 0">${esc(t('checkpoint_error'))}: ${esc(e.message)}</div>`;
+    // "Workspace does not exist" for remote paths — show as muted hint, not scary red error
+    if(e.message && e.message.includes('Workspace does not exist')){
+      container.innerHTML=`<div style="color:var(--muted);font-size:12px;padding:8px 0;display:flex;align-items:center;gap:6px"><span class="ws-status-dot remote" style="margin:0"></span>Remote workspace — checkpoints live on the remote host.</div>`;
+    } else {
+      container.innerHTML=`<div style="color:var(--error,#f87171);font-size:12px;padding:8px 0">${esc(t('checkpoint_error'))}: ${esc(e.message)}</div>`;
+    }
   }
 }
 
