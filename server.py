@@ -15,6 +15,23 @@ def _ignore_sigpipe() -> None:
     if (sigpipe := getattr(signal, "SIGPIPE", None)) is not None:
         signal.signal(sigpipe, signal.SIG_IGN)
 
+
+# WebUI must never inherit delegate_task child context — it would block
+# kanban DB migrations (write_txn) and make /api/kanban/* return 500
+# intermittently whenever the parent hermes session was a delegated child.
+# Clear it at import time so every code path (including kanban_bridge)
+# sees a clean env regardless of how server.py was launched.
+os.environ.pop("HERMES_DELEGATED_CHILD_CONTEXT", None)
+os.environ.pop("HERMES_KANBAN_BOARD", None)
+os.environ.pop("HERMES_KANBAN_TASK", None)
+os.environ.pop("HERMES_KANBAN_RUN_ID", None)
+try:
+    from agent.delegation_context import _DELEGATED_CHILD_CONTEXT as _webui_delegated_ctx
+    if _webui_delegated_ctx.get():
+        _webui_delegated_ctx.set(False)
+except Exception:
+    pass
+
 # Test-mode network isolation keeps subprocess-backed tests hermetic.
 if os.environ.get("HERMES_WEBUI_TEST_NETWORK_BLOCK", "").strip() in ("1", "true", "yes"):
     _REAL_CREATE_CONN = socket.create_connection

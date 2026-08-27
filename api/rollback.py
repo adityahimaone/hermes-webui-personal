@@ -67,18 +67,57 @@ def _checkpoint_root() -> Path:
     return _hermes_home() / "checkpoints"
 
 
-def _resolve_workspace(workspace: str) -> str:
+def _is_known_workspace(workspace: str) -> bool:
+    """Return True when workspace matches a known configured workspace path."""
+    try:
+        from api.workspace import load_workspaces
+        resolved = os.path.realpath(workspace)
+        for ws in load_workspaces():
+            p = ws.get("path", "")
+            if p and os.path.realpath(p) == resolved:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _is_remote_workspace(workspace: str) -> bool:
+    """Return True when workspace is a remote path not present on this host."""
+    try:
+        from api.workspace import _remote_terminal_workspace_candidate
+        if _remote_terminal_workspace_candidate(workspace) is not None:
+            return True
+    except Exception:
+        pass
+    # Fallback: known workspace that simply doesn't exist on this host
+    # (e.g. /Users/... Mac path or /c/... Windows path on a Linux VPS)
+    if _is_known_workspace(workspace) and not os.path.isdir(os.path.realpath(workspace)):
+        return True
+    return False
+
+
+def _resolve_workspace(workspace: str, *, allow_remote: bool = False) -> str:
     """Validate and return the canonical workspace path.
 
     Security: workspace must match a known configured workspace
     (from workspaces.json or session-attached workspaces).
+
+    For remote workspaces (e.g. /Users/... on Mac via Tailscale SSH),
+    the path won't exist on the VPS host — when allow_remote=True
+    (used by list_checkpoints) the local isdir check is skipped for
+    known remote paths so the UI can show a graceful empty state
+    instead of a hard error.
     """
     if not workspace or not isinstance(workspace, str):
         raise ValueError("workspace is required")
-    # Basic path validation
+    is_remote = _is_remote_workspace(workspace)
     resolved = os.path.realpath(workspace)
     if not os.path.isdir(resolved):
-        raise ValueError(f"Workspace does not exist: {workspace}")
+        if allow_remote and is_remote:
+            # Known remote workspace — let caller handle gracefully
+            pass
+        else:
+            raise ValueError(f"Workspace does not exist: {workspace}")
     # Security: confirm workspace is in the known list
     try:
         from api.workspace import load_workspaces
@@ -219,7 +258,16 @@ def list_checkpoints(workspace: str) -> dict[str, Any]:
         workspace: resolved workspace path
         checkpoint_dir: the checkpoint directory path
     """
-    resolved = _resolve_workspace(workspace)
+    resolved = _resolve_workspace(workspace, allow_remote=True)
+    # Remote workspace with no local checkpoint store — graceful empty
+    if _is_remote_workspace(workspace) and not os.path.isdir(resolved):
+        return {
+            "checkpoints": [],
+            "workspace": workspace,
+            "checkpoint_dir": "",
+            "remote": True,
+            "remote_hint": "Checkpoints live on the remote host — not on this server.",
+        }
     ws_hash = _workspace_hash(resolved)
     ckpt_dir = _checkpoint_root() / ws_hash
 
@@ -302,6 +350,11 @@ def get_checkpoint_diff(workspace: str, checkpoint: str) -> dict[str, Any]:
         diff: unified diff text
         files_changed: list of changed file paths
     """
+    if _is_remote_workspace(workspace) and not os.path.isdir(os.path.realpath(workspace)):
+        raise ValueError(
+            "Checkpoints for this remote workspace live on the remote host — "
+            "not on this server. Run Hermes on that device to view them."
+        )
     resolved = _resolve_workspace(workspace)
     checkpoint = _validate_checkpoint_id(checkpoint)
     ws_hash = _workspace_hash(resolved)
@@ -391,6 +444,11 @@ def restore_checkpoint(workspace: str, checkpoint: str) -> dict[str, Any]:
         ok: True
         files_restored: list of restored file paths
     """
+    if _is_remote_workspace(workspace) and not os.path.isdir(os.path.realpath(workspace)):
+        raise ValueError(
+            "Cannot restore — this remote workspace lives on another device. "
+            "Run Hermes on that device to restore checkpoints there."
+        )
     resolved = _resolve_workspace(workspace)
     workspace_root = Path(resolved)
     checkpoint = _validate_checkpoint_id(checkpoint)

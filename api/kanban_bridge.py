@@ -343,6 +343,12 @@ def _create_task_payload(body: dict, *, board=None):
         raise ValueError("priority must be an integer")
     kb = _kb()
     requested_status = body.get("status")
+    # Guard: remote workspace paths don't exist on VPS — fallback to scratch
+    _wk = body.get("workspace_kind") or "scratch"
+    _wp = body.get("workspace_path") or None
+    if _wp and isinstance(_wp, str) and _wp.strip().startswith(("/Users/", "/c/", "/d/", "/C:", "/D:")):
+        _wk = "scratch"
+        _wp = None
     with _conn(board=board) as conn:
         task_id = kb.create_task(
             conn,
@@ -354,8 +360,8 @@ def _create_task_payload(body: dict, *, board=None):
             priority=priority,
             parents=body.get("parents") or (),
             triage=bool(body.get("triage") or False),
-            workspace_kind=body.get("workspace_kind") or "scratch",
-            workspace_path=body.get("workspace_path") or None,
+            workspace_kind=_wk,
+            workspace_path=_wp,
             idempotency_key=body.get("idempotency_key") or None,
             max_runtime_seconds=body.get("max_runtime_seconds") or None,
             skills=body.get("skills") or None,
@@ -454,6 +460,39 @@ def _patch_task(conn, task_id: str, body: dict):
         # _validate_status guarantees we never reach here, but be defensive.
         raise ValueError(f"unknown status: {status}")
 
+
+
+def _reclaim_task_payload(task_id: str, body: dict, *, board=None):
+    """Reclaim a running task — kills worker, resets to ready/blocked."""
+    task_id = str(task_id or "").strip()
+    if not task_id:
+        raise ValueError("task_id is required")
+    reason = str(body.get("reason") or "stopped from WebUI").strip()
+    kb = _kb()
+    with _conn(board=board) as conn:
+        ok = kb.reclaim_task(conn, task_id, reason=reason)
+        if not ok:
+            raise LookupError("task not reclaimable (not running or not found)")
+        task = kb.get_task(conn, task_id)
+        return {"task": _task_dict(task) if task else None, "reclaimed": True}
+
+def _pause_task_payload(task_id: str, body: dict, *, board=None):
+    """Pause = block a running task (reclaim + block)."""
+    task_id = str(task_id or "").strip()
+    if not task_id:
+        raise ValueError("task_id is required")
+    reason = str(body.get("reason") or "paused from WebUI").strip()
+    kb = _kb()
+    with _conn(board=board) as conn:
+        # First reclaim if running
+        task = kb.get_task(conn, task_id)
+        if task and task.status == "running":
+            kb.reclaim_task(conn, task_id, reason=reason)
+        # Then block
+        if not kb.block_task(conn, task_id, reason=reason):
+            raise LookupError("task not found")
+        task = kb.get_task(conn, task_id)
+        return {"task": _task_dict(task) if task else None, "paused": True}
 
 def _patch_task_payload(task_id: str, body: dict, *, board=None):
     """Validate task_id, open a connection, and delegate field-level updates to _patch_task."""
@@ -1260,6 +1299,12 @@ def handle_kanban_post(handler, parsed, body) -> bool | None:
             if path.startswith(_TASK_PREFIX) and path.endswith(suffix):
                 task_id = path[len(_TASK_PREFIX):-len(suffix)].strip("/")
                 return j(handler, _task_action_payload(task_id, body, action, board=board)) or True
+        if path.startswith(_TASK_PREFIX) and path.endswith("/reclaim"):
+            task_id = path[len(_TASK_PREFIX):-len("/reclaim")].strip("/")
+            return j(handler, _reclaim_task_payload(task_id, body, board=board)) or True
+        if path.startswith(_TASK_PREFIX) and path.endswith("/pause"):
+            task_id = path[len(_TASK_PREFIX):-len("/pause")].strip("/")
+            return j(handler, _pause_task_payload(task_id, body, board=board)) or True
         if path.startswith(_TASK_PREFIX) and path.endswith("/patch"):
             task_id = path[len(_TASK_PREFIX):-len("/patch")].strip("/")
             return j(handler, _patch_task_payload(task_id, body, board=board)) or True

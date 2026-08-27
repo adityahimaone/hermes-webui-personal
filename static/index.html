@@ -1771,6 +1771,7 @@
 <div class="toast" id="toast"></div>
 <script src="static/i18n.js?v=__WEBUI_VERSION__" defer></script>
 <script src="static/icons.js?v=__WEBUI_VERSION__" defer></script>
+<script src="static/shadcn-combobox.js?v=__WEBUI_VERSION__" defer></script>
 <script src="static/assistant_turn_anchors.js?v=__WEBUI_VERSION__" defer></script>
 <script src="static/ui.js?v=__WEBUI_VERSION__" defer></script>
 <script src="static/workspace.js?v=__WEBUI_VERSION__" defer></script>
@@ -1779,6 +1780,7 @@
 <script src="static/commands.js?v=__WEBUI_VERSION__" defer></script>
 <script src="static/messages.js?v=__WEBUI_VERSION__" defer></script>
 <script src="static/extension_settings.js?v=__WEBUI_VERSION__" defer></script>
+<script src="static/shadcn-combobox.js?v=__WEBUI_VERSION__" defer></script>
 <script src="static/panels.js?v=__WEBUI_VERSION__" defer></script>
 <script src="static/onboarding.js?v=__WEBUI_VERSION__" defer></script>
 <script src="static/boot.js?v=__WEBUI_VERSION__" defer></script>
@@ -1805,7 +1807,8 @@
     </div>
     <div class="kanban-modal-row">
       <label for="kanbanBoardModalDefaultWorkdir" data-i18n="kanban_board_default_workdir">Default workspace path</label>
-      <input type="text" id="kanbanBoardModalDefaultWorkdir" list="kanbanBoardModalWorkdirs" maxlength="255" data-i18n-placeholder="kanban_board_default_workdir_placeholder" placeholder="Workspace path (optional)" autocomplete="off">
+      <input type="text" id="kanbanBoardModalDefaultWorkdir" maxlength="255" data-i18n-placeholder="kanban_board_default_workdir_placeholder" placeholder="Workspace path (optional)" autocomplete="off" hidden>
+      <div id="kanbanBoardModalDefaultWorkdirCombobox"></div>
       <datalist id="kanbanBoardModalWorkdirs"></datalist>
     </div>
     <div class="kanban-modal-row-inline">
@@ -1875,7 +1878,8 @@
     </div>
     <div class="kanban-modal-row" id="kanbanTaskModalWorkspacePathRow" style="display:none">
       <label for="kanbanTaskModalWorkspacePath" data-i18n="kanban_workspace_path">Workspace path</label>
-      <input type="text" id="kanbanTaskModalWorkspacePath" list="kanbanTaskModalWorkspacePathList" maxlength="255" autocomplete="off" data-i18n-placeholder="kanban_workspace_path_placeholder" placeholder="Path to workspace">
+      <input type="text" id="kanbanTaskModalWorkspacePath" maxlength="255" autocomplete="off" data-i18n-placeholder="kanban_workspace_path_placeholder" placeholder="Path to workspace" hidden>
+      <div id="kanbanTaskModalWorkspacePathCombobox"></div>
       <datalist id="kanbanTaskModalWorkspacePathList"></datalist>
     </div>
     <div class="kanban-modal-row">

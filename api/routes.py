@@ -10522,6 +10522,8 @@ from api.workspace import (
     _strip_surrounding_quotes,
     _is_remote_terminal_backend,
     _workspace_blocked_roots,
+    workspace_health,
+    workspaces_health,
 )
 from api.upload import (
     handle_upload,
@@ -14197,6 +14199,33 @@ def handle_get(handler, parsed) -> bool:
             },
         )
 
+    if parsed.path == "/api/workspaces/health":
+        # Optional ?path=... for single workspace, otherwise batch all
+        qs = parse_qs(parsed.query)
+        single = qs.get("path", [""])[0]
+        force = qs.get("force", [""])[0] == "1"
+        if single:
+            from api.workspace import workspace_health as _wh
+            return j(handler, _wh(single, force=force))
+        wss = load_workspaces()
+        return j(handler, {"health": workspaces_health(wss, force=force)})
+
+    if parsed.path == "/api/workspaces/filemap":
+        qs = parse_qs(parsed.query)
+        ws_path = qs.get("path", [""])[0]
+        if not ws_path:
+            return bad(handler, "path is required")
+        try:
+            from api.workspace import read_filemap as _read_fm
+            data = _read_fm(ws_path)
+            if data is None:
+                return j(handler, {"filemap": None, "reason": "no filemap — run: python3 ~/.hermes/scripts/filemap.py"})
+            return j(handler, {"filemap": data})
+        except ValueError as e:
+            return bad(handler, str(e), 404 if "not found" in str(e).lower() else 400)
+        except Exception as e:
+            return bad(handler, f"failed to read filemap: {e}", 500)
+
     if parsed.path == "/api/sessions/search":
         return _handle_sessions_search(handler, parsed)
 
@@ -14531,6 +14560,16 @@ def handle_get(handler, parsed) -> bool:
     if parsed.path == "/api/skills":
         qs = parse_qs(parsed.query)
         category = qs.get("category", [None])[0]
+        profile_name = (qs.get("profile") or [""])[0].strip()
+        if profile_name:
+            try:
+                from api.profiles import get_hermes_home_for_profile
+                ph = get_hermes_home_for_profile(profile_name)
+                if ph and (ph / "skills").exists():
+                    data = _skills_list_from_dir(ph / "skills", category=category)
+                    return j(handler, {"skills": data.get("skills", [])})
+            except Exception:
+                pass
         data = _skills_list_from_dir(_active_skills_dir(), category=category)
         return j(handler, {"skills": data.get("skills", [])})
 
@@ -14607,6 +14646,9 @@ def handle_get(handler, parsed) -> bool:
     # ── Memory API (GET) ──
     if parsed.path == "/api/memory":
         return _handle_memory_read(handler, parsed)
+
+    if parsed.path == "/api/knowledge":
+        return _handle_knowledge_read(handler, parsed)
 
     # ── Profile API (GET) ──
     if parsed.path == "/api/profiles":
@@ -22139,10 +22181,25 @@ def _read_active_project_context(workspace: Path | None) -> dict:
 
 
 def _handle_memory_read(handler, parsed=None):
+    # Support ?profile=<name> to read SOUL.md for a specific profile (for
+    # profile detail preview — Evonic-style per-agent persona). Falls back
+    # to active profile if not specified or invalid.
+    profile_override = None
+    if parsed is not None:
+        try:
+            qs = parse_qs(parsed.query or "")
+            raw = (qs.get("profile") or [""])[0].strip()
+            if raw:
+                from api.profiles import get_hermes_home_for_profile
+                ph = get_hermes_home_for_profile(raw)
+                if ph and ph.exists():
+                    profile_override = ph
+        except Exception:
+            pass
     try:
         from api.profiles import get_active_hermes_home
 
-        home = get_active_hermes_home()
+        home = profile_override if profile_override is not None else get_active_hermes_home()
         mem_dir = home / "memories"
     except ImportError:
         home = Path.home() / ".hermes"
@@ -22198,6 +22255,111 @@ def _handle_memory_read(handler, parsed=None):
             "external_notes_enabled": _external_notes_sources_enabled(cfg),
         },
     )
+
+
+def _handle_knowledge_read(handler, parsed=None):
+    """Knowledge base (kb/) for Memory panel — Evonic mirror.
+
+    GET /api/knowledge?profile=<name>&view=list|graph
+    - list: {docs: [{slug, title, doc_type, source_dir, tags, updated_at}]}
+    - graph: {nodes: {slug: {slug,title,type,source_dir,tags}}, links: [{source,target,edge_type}], dangling: [...]}
+    Falls back to active profile if ?profile invalid/missing.
+    """
+    from urllib.parse import parse_qs
+    profile_override = None
+    view = "list"
+    if parsed is not None:
+        try:
+            qs = parse_qs(parsed.query or "")
+            raw = (qs.get("profile") or [""])[0].strip()
+            if raw:
+                from api.profiles import get_hermes_home_for_profile
+                ph = get_hermes_home_for_profile(raw)
+                if ph and ph.exists():
+                    profile_override = ph
+            v = (qs.get("view") or [""])[0].strip()
+            if v in ("graph", "list"):
+                view = v
+        except Exception:
+            pass
+    try:
+        from api.profiles import get_active_hermes_home
+        home = profile_override if profile_override is not None else get_active_hermes_home()
+    except ImportError:
+        home = Path.home() / ".hermes"
+    kb_dir = home / "kb"
+    db_path = kb_dir / ".evomem.db"
+    # Fallback: if active profile has no kb (default profile), try jihyo/karina/ningning
+    if not db_path.is_file() and profile_override is None:
+        for fallback in ("jihyo", "karina", "ningning"):
+            try:
+                from api.profiles import get_hermes_home_for_profile
+                ph = get_hermes_home_for_profile(fallback)
+                if ph and (ph / "kb" / ".evomem.db").is_file():
+                    home = ph
+                    kb_dir = home / "kb"
+                    db_path = kb_dir / ".evomem.db"
+                    break
+            except Exception:
+                continue
+    # Try evomem DB first for graph view
+    if view == "graph" and db_path.is_file():
+        try:
+            import sqlite3, json as _json
+            conn = sqlite3.connect(str(db_path))
+            conn.row_factory = sqlite3.Row
+            nodes = {}
+            for r in conn.execute(
+                "SELECT slug, title, doc_type, source_dir, tags FROM docs WHERE deleted_at IS NULL AND source_dir != 'inbox'"
+            ):
+                try:
+                    tags = _json.loads(r["tags"] or "[]")
+                    tags = tags if isinstance(tags, list) else []
+                except Exception:
+                    tags = []
+                nodes[r["slug"]] = {"slug": r["slug"], "title": r["title"], "type": r["doc_type"], "source_dir": r["source_dir"], "tags": tags}
+            links, dangling = [], []
+            for r in conn.execute(
+                "SELECT src.slug AS s, l.edge_type AS e, l.dst_slug AS d, dst.slug AS dslug, l.dst_doc_id AS dpid, dst.deleted_at AS ddel "
+                "FROM links l JOIN docs src ON l.src_doc_id = src.id LEFT JOIN docs dst ON l.dst_doc_id = dst.id WHERE src.deleted_at IS NULL"
+            ):
+                if r["s"] not in nodes:
+                    continue
+                if r["dpid"] is not None and r["ddel"] is None and r["dslug"] in nodes:
+                    links.append({"source": r["s"], "target": r["dslug"], "edge_type": r["e"]})
+                elif r["dpid"] is None:
+                    dangling.append({"source": r["s"], "target": r["d"]})
+            conn.close()
+            return j(handler, {"nodes": nodes, "links": links, "dangling": dangling, "count": len(nodes), "kb_path": str(kb_dir)})
+        except Exception as e:
+            logger.warning("knowledge graph failed: %s", e)
+    # List view: read .md files + evomem docs
+    docs = []
+    if db_path.is_file():
+        try:
+            import sqlite3, json as _json
+            conn = sqlite3.connect(str(db_path))
+            conn.row_factory = sqlite3.Row
+            for r in conn.execute("SELECT slug, title, doc_type, source_dir, tags, updated_at FROM docs WHERE deleted_at IS NULL ORDER BY updated_at DESC LIMIT 500"):
+                try:
+                    tags = _json.loads(r["tags"] or "[]")
+                    tags = tags if isinstance(tags, list) else []
+                except Exception:
+                    tags = []
+                docs.append({"slug": r["slug"], "title": r["title"], "doc_type": r["doc_type"], "source_dir": r["source_dir"], "tags": tags, "updated_at": r["updated_at"]})
+            conn.close()
+        except Exception:
+            pass
+    if not docs and kb_dir.is_dir():
+        for p in sorted(kb_dir.glob("*.md")):
+            if p.name.startswith("."):
+                continue
+            try:
+                st = p.stat()
+                docs.append({"slug": p.stem, "title": p.stem.replace("-", " ").title(), "doc_type": "note", "source_dir": "", "tags": [], "updated_at": st.st_mtime})
+            except Exception:
+                continue
+    return j(handler, {"docs": docs, "count": len(docs), "kb_path": str(kb_dir)})
 
 
 # ── POST route helpers ────────────────────────────────────────────────────────

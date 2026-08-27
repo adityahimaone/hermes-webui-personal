@@ -841,6 +841,21 @@ def resolve_trusted_workspace(path: str | Path | None = None) -> Path:
 
     candidate = _resolve_path(path)
 
+    # Trusted if already in the saved workspace list — check BEFORE the
+    # access_error gate. A registered workspace that lives on another device
+    # (e.g. /Users/... on Mac, /c/... on Windows, registered via a different
+    # host or added manually) was validated at add-time and should remain
+    # trusted for session binding even when this host can't stat() it.
+    # Without this, activating a remote workspace from the UI fails with
+    # "Path does not exist" and the workspace stays perpetually Inactive.
+    try:
+        saved = load_workspaces()
+        saved_paths = {_resolve_path(w["path"]) for w in saved if w.get("path")}
+        if candidate in saved_paths:
+            return candidate
+    except Exception:
+        pass
+
     access_error = _workspace_access_error(candidate)
     remote_candidate = _remote_terminal_workspace_candidate(path)
     if access_error:
@@ -866,15 +881,6 @@ def resolve_trusted_workspace(path: str | Path | None = None) -> Path:
 
     if _is_blocked_workspace_path(candidate, path):
         raise ValueError(f"Path points to a system directory: {candidate}")
-
-    # (B) Trusted if already in the saved workspace list — covers non-home installs
-    try:
-        saved = load_workspaces()
-        saved_paths = {_resolve_path(w["path"]) for w in saved if w.get("path")}
-        if candidate in saved_paths:
-            return candidate
-    except Exception:
-        pass
 
     # (C) Trusted if it is equal to or under the boot-time DEFAULT_WORKSPACE.
     #     In Docker deployments HERMES_WEBUI_DEFAULT_WORKSPACE is often set to a
@@ -976,6 +982,22 @@ def validate_workspace_to_add(path: str) -> Path:
 
     access_error = _workspace_access_error(candidate)
     remote_candidate = _remote_terminal_workspace_candidate(path)
+
+    # Trusted if already in the saved workspace list — check BEFORE the
+    # access_error gate. A registered workspace that lives on another device
+    # (e.g. /Users/... on Mac, /c/... on Windows, registered via a different
+    # host or added manually) was validated at add-time and should remain
+    # trusted for session binding even when this host can't stat() it.
+    # Without this, activating a remote workspace from the UI fails with
+    # "Path does not exist" and the workspace stays perpetually Inactive.
+    try:
+        saved = load_workspaces()
+        saved_paths = {_resolve_path(w["path"]) for w in saved if w.get("path")}
+        if candidate in saved_paths:
+            return candidate
+    except Exception:
+        pass
+
     if access_error:
         # Remote terminal profiles validate workspace existence on the target
         # machine, not on the WebUI server. Permit target-side paths under
@@ -1839,3 +1861,191 @@ def git_info_for_workspace(workspace: Path) -> dict:
         'behind': behind,
         'is_git': True,
     }
+
+
+# ── Workspace health (Tailscale ping) ──────────────────────────────────
+
+# Map workspace path prefixes to Tailscale hostnames/IPs.
+# Mac paths (/Users/...) -> mac-tailscale, Windows paths (/c/, /d/...) -> windows-tailscale.
+# Local paths (/home/...) are always healthy (no ping needed).
+_TAILSCALE_HOST_MAP: dict[str, str] = {
+    "/Users/": "100.75.2.78",   # mac-tailscale
+    "/c/":     "100.122.101.28", # windows-tailscale
+    "/d/":     "100.122.101.28",
+    "/C:":     "100.122.101.28",
+    "/D:":     "100.122.101.28",
+}
+
+_WS_HEALTH_CACHE: dict[str, dict] = {}
+_WS_HEALTH_TTL = 30  # seconds
+_WS_HEALTH_LOCK = threading.Lock()
+
+
+def _classify_workspace(path: str) -> str:
+    """Return 'local' | 'remote-mac' | 'remote-win' | 'unknown'."""
+    if not path:
+        return "unknown"
+    if path.startswith("/home/"):
+        return "local"
+    if path.startswith("/Users/"):
+        return "remote-mac"
+    if path.startswith(("/c/", "/d/", "/C:", "/D:")):
+        return "remote-win"
+    return "unknown"
+
+
+def _tailscale_ip_for_path(path: str) -> str | None:
+    for prefix, ip in _TAILSCALE_HOST_MAP.items():
+        if path.startswith(prefix):
+            return ip
+    return None
+
+
+def _ping_host(ip: str, timeout: float = 2.0) -> dict:
+    """Ping via Tailscale ping (preferred) or plain ping fallback."""
+    # Try tailscale ping first (works even without ICMP)
+    try:
+        r = subprocess.run(
+            ["tailscale", "ping", "--c", "1", "--timeout", f"{timeout}s", ip],
+            capture_output=True, text=True, timeout=timeout + 1,
+        )
+        if r.returncode == 0 and "pong" in r.stdout.lower():
+            # Extract latency e.g. "in 24ms"
+            import re
+            m = re.search(r"in\s+(\d+)ms", r.stdout)
+            latency = int(m.group(1)) if m else None
+            return {"reachable": True, "latency_ms": latency, "method": "tailscale"}
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        pass
+    # Fallback: plain ping
+    try:
+        r = subprocess.run(
+            ["ping", "-c", "1", "-W", "2", ip],
+            capture_output=True, text=True, timeout=timeout + 1,
+        )
+        if r.returncode == 0:
+            import re
+            m = re.search(r"time=(\d+\.?\d*)\s*ms", r.stdout)
+            latency = int(float(m.group(1))) if m else None
+            return {"reachable": True, "latency_ms": latency, "method": "ping"}
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        pass
+    return {"reachable": False, "latency_ms": None, "method": "none"}
+
+
+def workspace_health(path: str, *, force: bool = False) -> dict:
+    """Return health info for a single workspace path (cached)."""
+    kind = _classify_workspace(path)
+    if kind == "local":
+        return {"kind": kind, "reachable": True, "latency_ms": None, "cached": False}
+    if kind == "unknown":
+        return {"kind": kind, "reachable": None, "latency_ms": None, "cached": False}
+    ip = _tailscale_ip_for_path(path)
+    if not ip:
+        return {"kind": kind, "reachable": None, "latency_ms": None, "cached": False}
+    now = time.time()
+    with _WS_HEALTH_LOCK:
+        cached = _WS_HEALTH_CACHE.get(ip)
+        if not force and cached and (now - cached["_ts"] < _WS_HEALTH_TTL):
+            return {k: v for k, v in cached.items() if k != "_ts"} | {"cached": True}
+    result = _ping_host(ip)
+    payload = {"kind": kind, "reachable": result["reachable"], "latency_ms": result["latency_ms"], "cached": False}
+    with _WS_HEALTH_LOCK:
+        _WS_HEALTH_CACHE[ip] = payload | {"_ts": now}
+    return payload
+
+
+def workspaces_health(workspaces: list, *, force: bool = False) -> list:
+    """Batch health for all workspaces (parallel ping for remotes)."""
+    # Collect unique IPs needing ping
+    ip_to_indices: dict[str, list[int]] = {}
+    results: list[dict | None] = [None] * len(workspaces)
+    for i, ws in enumerate(workspaces):
+        path = ws.get("path", "") if isinstance(ws, dict) else str(ws)
+        kind = _classify_workspace(path)
+        if kind == "local":
+            results[i] = {"kind": kind, "reachable": True, "latency_ms": None, "cached": False}
+        elif kind == "unknown":
+            results[i] = {"kind": kind, "reachable": None, "latency_ms": None, "cached": False}
+        else:
+            ip = _tailscale_ip_for_path(path)
+            if not ip:
+                results[i] = {"kind": kind, "reachable": None, "latency_ms": None, "cached": False}
+            else:
+                ip_to_indices.setdefault(ip, []).append(i)
+
+    if ip_to_indices:
+        # Use cache where valid, ping the rest in parallel
+        to_ping: list[str] = []
+        for ip, indices in ip_to_indices.items():
+            if not force:
+                with _WS_HEALTH_LOCK:
+                    cached = _WS_HEALTH_CACHE.get(ip)
+                if cached and (time.time() - cached["_ts"] < _WS_HEALTH_TTL):
+                    payload = {k: v for k, v in cached.items() if k != "_ts"} | {"cached": True}
+                    for idx in indices:
+                        results[idx] = payload
+                    continue
+            to_ping.append(ip)
+
+        if to_ping:
+            ping_results: dict[str, dict] = {}
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(to_ping)) as pool:
+                futs = {pool.submit(_ping_host, ip): ip for ip in to_ping}
+                for fut in concurrent.futures.as_completed(futs):
+                    ip = futs[fut]
+                    try:
+                        ping_results[ip] = fut.result()
+                    except Exception:
+                        ping_results[ip] = {"reachable": False, "latency_ms": None, "method": "none"}
+            now = time.time()
+            for ip in to_ping:
+                pr = ping_results[ip]
+                kind = "remote-mac" if ip == "100.75.2.78" else "remote-win"
+                payload = {"kind": kind, "reachable": pr["reachable"], "latency_ms": pr["latency_ms"], "cached": False}
+                with _WS_HEALTH_LOCK:
+                    _WS_HEALTH_CACHE[ip] = payload | {"_ts": now}
+                for idx in ip_to_indices[ip]:
+                    if results[idx] is None:
+                        results[idx] = payload
+
+    return results
+
+
+def read_filemap(workspace_path: str) -> dict | None:
+    """Read artifacts/filemap.json for a workspace, if present.
+
+    Returns None if missing, raises ValueError on blocked path or oversized file.
+    Validates against blocked-workspace rules; only local VPS paths are served
+    (remote workspaces have no filemap on this host).
+    """
+    if not workspace_path:
+        raise ValueError("path is required")
+    candidate = Path(workspace_path)
+    # Block check — reuse workspace path guard
+    if _is_blocked_workspace_path(candidate, workspace_path):
+        raise ValueError("blocked workspace path")
+    # Must be a directory
+    try:
+        if not candidate.is_dir():
+            raise ValueError("workspace not found")
+    except Exception:
+        raise ValueError("workspace not found")
+    fm = candidate / "artifacts" / "filemap.json"
+    if not fm.exists():
+        return None
+    # Size guard — filemap should be < 500KB, cap at 2MB
+    try:
+        sz = fm.stat().st_size
+    except Exception:
+        return None
+    if sz > 2_000_000:
+        raise ValueError("filemap too large")
+    try:
+        data = json.loads(fm.read_text(encoding="utf-8"))
+    except Exception as e:
+        raise ValueError(f"failed to read filemap: {e}")
+    # Minimal shape validation
+    if not isinstance(data, dict) or "files" not in data:
+        raise ValueError("invalid filemap format")
+    return data
