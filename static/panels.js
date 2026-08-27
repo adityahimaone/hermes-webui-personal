@@ -2450,7 +2450,7 @@ function _kanbanCardQuickActions(task){
 
 async function kanbanStopTask(event, taskId){
   if(event) event.stopPropagation();
-  if(!confirm('Stop this running task? Worker will be terminated and task returns to queue.')) return;
+  { const _ok=await showConfirmDialog({title:'Stop task?',message:'Worker will be terminated and task returns to queue.',confirmLabel:'Stop',danger:true,focusCancel:true}); if(!_ok) return; }
   try{
     await api('/api/kanban/tasks/'+encodeURIComponent(taskId)+'/reclaim'+_kanbanBoardQuery(), {method:'POST', body: JSON.stringify({reason:'stopped from card'})});
     showToast('Task stopped');
@@ -2461,7 +2461,7 @@ async function kanbanStopTask(event, taskId){
 
 async function kanbanPauseTask(event, taskId){
   if(event) event.stopPropagation();
-  if(!confirm('Pause this task? Worker stopped and task will be blocked.')) return;
+  { const _ok=await showConfirmDialog({title:'Pause task?',message:'Worker stopped and task will be blocked.',confirmLabel:'Pause',danger:true,focusCancel:true}); if(!_ok) return; }
   try{
     await api('/api/kanban/tasks/'+encodeURIComponent(taskId)+'/pause'+_kanbanBoardQuery(), {method:'POST', body: JSON.stringify({reason:'paused from card'})});
     showToast('Task paused');
@@ -3884,7 +3884,7 @@ async function kanbanGateAction(taskId, comment){
   }catch(e){ showToast(e.message||String(e),4000,'error'); }
 }
 async function kanbanGateFix(taskId){
-  var msg=prompt('Fix notes (posted as comment):'); if(!msg) return;
+  var msg=await showPromptDialog({title:'Request fix',message:'Fix notes (posted as comment):',placeholder:'Describe what needs fixing...',confirmLabel:'Send fix request'}); if(!msg) return;
   await kanbanGateAction(taskId,'fix: '+msg);
 }
 
