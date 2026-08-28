@@ -20,7 +20,7 @@ from dataclasses import asdict, is_dataclass
 from urllib.parse import parse_qs, unquote
 
 from api.helpers import bad, j
-from api.workspace import resolve_trusted_workspace
+from api.workspace import load_workspaces, resolve_trusted_workspace
 
 BOARD_COLUMNS = ["triage", "todo", "ready", "running", "blocked", "done"]
 _TASK_PREFIX = "/api/kanban/tasks/"
@@ -343,12 +343,20 @@ def _create_task_payload(body: dict, *, board=None):
         raise ValueError("priority must be an integer")
     kb = _kb()
     requested_status = body.get("status")
-    # Guard: remote workspace paths don't exist on VPS — fallback to scratch
     _wk = body.get("workspace_kind") or "scratch"
     _wp = body.get("workspace_path") or None
-    if _wp and isinstance(_wp, str) and _wp.strip().startswith(("/Users/", "/c/", "/d/", "/C:", "/D:")):
-        _wk = "scratch"
-        _wp = None
+    space_id = str(body.get("space_id") or "").strip() or None
+    space = None
+    if space_id:
+        space = next((item for item in load_workspaces() if item.get("id") == space_id), None)
+        if not space:
+            raise ValueError(f"unknown space_id: {space_id}")
+        transport = space.get("transport", "local")
+        if transport not in {"local", "ssh"}:
+            raise ValueError(f"unsupported space transport: {transport!r}")
+        _wp = space.get("remote_path") if transport == "ssh" else space.get("path")
+        if not _wp:
+            raise ValueError(f"space {space_id!r} has no workspace path")
     with _conn(board=board) as conn:
         task_id = kb.create_task(
             conn,
@@ -362,6 +370,9 @@ def _create_task_payload(body: dict, *, board=None):
             triage=bool(body.get("triage") or False),
             workspace_kind=_wk,
             workspace_path=_wp,
+            workspace_space_id=space_id,
+            workspace_transport=space.get("transport") if space else None,
+            workspace_ssh_target=space.get("ssh_target") if space else None,
             idempotency_key=body.get("idempotency_key") or None,
             max_runtime_seconds=body.get("max_runtime_seconds") or None,
             skills=body.get("skills") or None,

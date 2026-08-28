@@ -11,6 +11,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import posixpath
 import secrets
 import shutil
@@ -293,7 +294,25 @@ def _clean_workspace_list(workspaces: list) -> list:
         # Rename confusing 'default' label to 'Home'
         if name.lower() == 'default':
             name = 'Home'
-        result.append({'path': str(p), 'name': name})
+        normalized = dict(w)
+        is_remote = normalized.get('transport') == 'ssh' or name.lower().startswith('remote ')
+        normalized.setdefault(
+            'id',
+            re.sub(r'[^a-z0-9]+', '-', name.lower()).strip('-') or hashlib.sha1(str(path).encode()).hexdigest()[:12],
+        )
+        if is_remote:
+            normalized['transport'] = 'ssh'
+            normalized.setdefault(
+                'ssh_target',
+                'windows-tailscale' if 'windows' in name.lower() else 'mac-tailscale',
+            )
+            normalized.setdefault('remote_path', str(path))
+            normalized['path'] = str(path)
+        else:
+            normalized['path'] = str(p)
+        normalized['name'] = name
+        normalized.setdefault('transport', 'local')
+        result.append(normalized)
     return result
 
 
@@ -340,7 +359,7 @@ def _migrate_global_workspaces() -> list:
     try:
         raw = json.loads(_GLOBAL_WS_FILE.read_text(encoding='utf-8'))
         cleaned = _clean_workspace_list(raw)
-        if len(cleaned) != len(raw):
+        if cleaned != raw:
             # Rewrite the cleaned version so future reads are already clean
             _GLOBAL_WS_FILE.write_text(
                 json.dumps(cleaned, ensure_ascii=False, indent=2), encoding='utf-8'
@@ -356,7 +375,7 @@ def load_workspaces() -> list:
         try:
             raw = json.loads(ws_file.read_text(encoding='utf-8'))
             cleaned = _clean_workspace_list(raw)
-            if len(cleaned) != len(raw):
+            if cleaned != raw:
                 # Persist the cleaned version so stale entries don't keep reappearing
                 try:
                     ws_file.write_text(
@@ -380,13 +399,13 @@ def load_workspaces() -> list:
         if migrated:
             return migrated
     # Fresh start: single entry from the profile's configured workspace, labeled "Home"
-    return [{'path': _profile_default_workspace(), 'name': 'Home'}]
+    return _clean_workspace_list([{'path': _profile_default_workspace(), 'name': 'Home'}])
 
 
 def save_workspaces(workspaces: list) -> None:
     ws_file = _workspaces_file()
     ws_file.parent.mkdir(parents=True, exist_ok=True)
-    ws_file.write_text(json.dumps(workspaces, ensure_ascii=False, indent=2), encoding='utf-8')
+    ws_file.write_text(json.dumps(_clean_workspace_list(workspaces), ensure_ascii=False, indent=2), encoding='utf-8')
 
 
 def get_profile_default_workspace() -> str:

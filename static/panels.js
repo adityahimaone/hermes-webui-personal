@@ -3328,6 +3328,32 @@ async function _kanbanLoadProfileNames(){
   }
 }
 
+function _kanbanPopulateSpaces(currentValue){
+  const sel = document.getElementById('kanbanTaskModalSpace');
+  if (!sel) return;
+  const spaces = Array.isArray(_workspaceList) ? _workspaceList : [];
+  sel.innerHTML = '<option value="">Manual path / scratch</option>';
+  for (const space of spaces) {
+    if (!space || !space.id) continue;
+    const option = document.createElement('option');
+    option.value = space.id;
+    option.textContent = space.name || space.id;
+    sel.appendChild(option);
+  }
+  sel.value = currentValue || '';
+}
+
+function _kanbanOnSpaceChange(){
+  const spaceEl = document.getElementById('kanbanTaskModalSpace');
+  const pathRowEl = document.getElementById('kanbanTaskModalWorkspacePathRow');
+  if (!spaceEl || !pathRowEl) return;
+  if (spaceEl.value) {
+    pathRowEl.style.display = 'none';
+    return;
+  }
+  _kanbanOnWorkspaceKindChange();
+}
+
 async function _kanbanPopulateAssigneeSelect(currentValue){
   const sel = document.getElementById('kanbanTaskModalAssignee');
   if (!sel) return;
@@ -3391,6 +3417,7 @@ function openKanbanCreate(){
   _kanbanResetTaskModalFields({status: 'ready'});
   _kanbanSetTaskModalStatusHint(null);
   _kanbanSetTaskModalLabels('create');
+  _kanbanPopulateSpaces('');
   _kanbanPopulateAssigneeSelect('').then(() => {
     // After the dropdown is populated, default-select the first profile (not
     // the "Unassigned" fallthrough).  This is the right hint: most users want
@@ -3676,6 +3703,7 @@ async function submitKanbanTaskModal(){
   const tenantEl = document.getElementById('kanbanTaskModalTenant');
   const priorityEl = document.getElementById('kanbanTaskModalPriority');
   const workspaceKindEl = document.getElementById('kanbanTaskModalWorkspaceKind');
+  const spaceEl = document.getElementById('kanbanTaskModalSpace');
   const workspacePathEl = document.getElementById('kanbanTaskModalWorkspacePath');
   const skillsEl = document.getElementById('kanbanTaskModalSkills');
   const maxRuntimeEl = document.getElementById('kanbanTaskModalMaxRuntimeSeconds');
@@ -3693,7 +3721,7 @@ async function submitKanbanTaskModal(){
   const isEdit = _kanbanTaskModalMode === 'edit';
   // Validate workspace path for non-scratch workspace kinds (create mode only)
   const workspaceKind = workspaceKindEl ? workspaceKindEl.value : 'scratch';
-  if (!isEdit && workspaceKind !== 'scratch') {
+  if (!isEdit && workspaceKind !== 'scratch' && !(spaceEl && spaceEl.value.trim())) {
     const workspacePath = workspacePathEl ? workspacePathEl.value.trim() : '';
     if (!workspacePath) {
       if (errEl) errEl.textContent = t('kanban_workspace_path_required') || 'Workspace path is required for non-scratch workspaces.';
@@ -3708,6 +3736,8 @@ async function submitKanbanTaskModal(){
   const statusVal = statusEl ? statusEl.value : '';
   const priorityRaw = priorityEl ? priorityEl.value : '';
   const workspacePathVal = workspacePathEl ? workspacePathEl.value.trim() : '';
+  const spaceId = spaceEl ? spaceEl.value.trim() : '';
+  if (spaceId) payload.space_id = spaceId;
   const skillsRaw = skillsEl ? skillsEl.value.trim() : '';
   const maxRuntimeRaw = maxRuntimeEl ? maxRuntimeEl.value.trim() : '';
   const parentsRaw = parentsEl ? parentsEl.value.trim() : '';
@@ -3883,6 +3913,10 @@ async function kanbanGateAction(taskId, comment){
     await loadKanbanTask(taskId); await _kanbanRefreshBoard();
   }catch(e){ showToast(e.message||String(e),4000,'error'); }
 }
+function kanbanCopyTaskId(taskId){
+  if(!taskId) return;
+  try{ if(navigator.clipboard&&navigator.clipboard.writeText) navigator.clipboard.writeText(taskId); else { var ta=document.createElement('textarea'); ta.value=taskId; ta.style.position='fixed'; ta.style.opacity='0'; document.body.appendChild(ta); ta.select(); document.execCommand('copy'); ta.remove(); } showToast('Copied: '+taskId,2000); }catch(e){ showToast(e.message||String(e),4000,'error'); }
+}
 async function kanbanGateFix(taskId){
   var msg=await showPromptDialog({title:'Request fix',message:'Fix notes (posted as comment):',placeholder:'Describe what needs fixing...',confirmLabel:'Send fix request'}); if(!msg) return;
   await kanbanGateAction(taskId,'fix: '+msg);
@@ -3916,6 +3950,7 @@ function _kanbanRenderTaskDetail(data){
       <div class="kanban-task-preview-title">${esc(title)}</div>
       <button class="btn secondary kanban-edit-btn" onclick="openKanbanEdit('${esc(task.id)}')" data-i18n="kanban_edit_task" title="${esc(t('kanban_edit_task') || 'Edit task')}">${esc(t('kanban_edit_task') || 'Edit task')}</button>
     </div>
+    <div class="kanban-task-id-row" style="display:flex;align-items:center;gap:6px;margin:6px 0 10px 0;font-size:11px;color:var(--muted);"><span class="kanban-task-id-label" style="font-weight:600;letter-spacing:0.03em;text-transform:uppercase;">ID</span><code class="kanban-task-id" style="font-family:var(--font-mono,monospace);font-size:11px;padding:2px 6px;border:1px solid var(--border);border-radius:4px;background:var(--panel);user-select:all;word-break:break-all;">${esc(task.id||'')}</code><button class="btn secondary kanban-copy-id-btn" style="padding:2px 6px;font-size:11px;" onclick="kanbanCopyTaskId('${esc(task.id||'')}')" title="Copy task ID">⎘ Copy</button></div>
     <div class="kanban-task-preview-body">${_kanbanRenderMarkdown(body)}</div>
     ${meta.length ? `<div class="kanban-meta">${esc(meta.join(' · '))}</div>` : ''}
     ${_kanbanGateHtml(task, events)}
@@ -7275,6 +7310,11 @@ async function loadProfilesPanel() {
         ? `<span class="profile-opt-badge running" title="${esc(t('profile_gateway_running'))}"></span>`
         : `<span class="profile-opt-badge stopped" title="${esc(t('profile_gateway_stopped'))}"></span>`;
       const isActive = p.name === activeName;
+      const activity = p.status || {};
+      const activityTone = activity.status === 'running' ? 'ok' : activity.status === 'busy' ? 'warn' : '';
+      const activityLabel = activity.status || 'idle';
+      const activityDetail = activity.source ? ` <span style="font-size:11px;color:var(--muted)">${esc(activity.source)}${activity.title ? ` · ${esc(activity.title)}` : ''}${activity.board ? ` · ${esc(activity.board)}` : ''}</span>` : '';
+      const statusBadge = `<span class="detail-badge ${activityTone}">${esc(activityLabel)}</span>${activityDetail}`;
       const activeBadge = isActive ? `<span style="color:var(--link);font-size:10px;font-weight:600;margin-left:6px">${esc(t('profile_active'))}</span>` : '';
       const defaultBadge = p.is_default ? ` <span style="opacity:.5">${esc(t('profile_default_label'))}</span>` : '';
       const hiddenBadge = p.visible === false ? ' <span class="detail-badge" title="Hidden from chat">Hidden from chat</span>' : '';
@@ -7282,6 +7322,7 @@ async function loadProfilesPanel() {
         <div class="profile-card-header">
           <div style="min-width:0;flex:1">
             <div class="profile-card-name${isActive ? ' is-active' : ''}">${gwDot}${esc(p.name)}${defaultBadge}${activeBadge}${hiddenBadge}</div>
+            <div class="profile-card-meta">${statusBadge}</div>
             ${meta.length ? `<div class="profile-card-meta">${esc(meta.join(' \u00b7 '))}</div>` : `<div class="profile-card-meta">${esc(t('profile_no_configuration'))}</div>`}
           </div>
         </div>`;
@@ -7342,8 +7383,12 @@ function _renderProfileDetail(p, activeName){
   const rows = [];
   rows.push(`<div class="detail-row"><div class="detail-row-label">Status</div><div class="detail-row-value">${statusBadge}${defaultBadge}</div></div>`);
   rows.push(`<div class="detail-row"><div class="detail-row-label">Gateway</div><div class="detail-row-value">${gwBadge}</div></div>`);
-  if (p.model) rows.push(`<div class="detail-row"><div class="detail-row-label">Model</div><div class="detail-row-value"><code>${esc(p.model)}</code></div></div>`);
-  if (p.provider) rows.push(`<div class="detail-row"><div class="detail-row-label">Provider</div><div class="detail-row-value">${esc(p.provider)}</div></div>`);
+  // Editable model row — dropdown populated from /api/models (mirrors create form)
+  {
+    const initModel = esc(p.model || '');
+    const initProv = p.provider ? ` <span style="font-size:11px;color:var(--muted)">(${esc(p.provider)})</span>` : '';
+    rows.push(`<div class="detail-row"><div class="detail-row-label">Model</div><div class="detail-row-value" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><select id="profileDetailModel" style="min-width:180px;max-width:100%"></select><button class="btn secondary small" id="btnSaveProfileModel" onclick="saveProfileModel('${esc(p.name)}')" title="Save model">${li('check',12)} Save</button>${initProv}</div></div><div class="detail-row" style="margin-top:2px"><div class="detail-row-label"></div><div class="detail-row-value" id="profileDetailModelHint" style="font-size:11px;color:var(--muted)">${initModel ? `Current: <code>${initModel}</code>` : 'No model set — picks provider default.'}</div></div><div id="profileDetailModelErr" class="detail-form-error" style="display:none;margin-top:4px"></div>`);
+  }
   if (p.base_url) rows.push(`<div class="detail-row"><div class="detail-row-label">Base URL</div><div class="detail-row-value"><code>${esc(p.base_url)}</code></div></div>`);
   rows.push(`<div class="detail-row"><div class="detail-row-label">API key</div><div class="detail-row-value">${p.has_env ? esc(t('profile_api_keys_configured')) : '<span style="color:var(--muted)">Not configured</span>'}</div></div>`);
   if (p.total_skills && p.total_skills > 0) rows.push(`<div class="detail-row"><div class="detail-row-label">Skills</div><div class="detail-row-value">${esc(t('profile_skill_count', p.total_skills).replace(String(p.total_skills), `${p.enabled_skills} / ${p.total_skills}`))}</div></div>`);
@@ -7385,6 +7430,8 @@ function _renderProfileDetail(p, activeName){
   // Async hydrate: SOUL.md + personalities + skills (per-profile, no extra nav)
   _loadProfilePersona(p.name, detailId);
   _loadProfileSkills(p.name, detailId);
+  // Model picker for existing profile (editable)
+  _populateProfileDetailModelSelect(p);
 }
 
 function _setProfileHeaderButtons(mode, p, activeName){
@@ -8206,6 +8253,108 @@ async function saveProfileForm(){
   }
 }
 
+// ── Profile detail: editable model (existing profile) ──
+async function _populateProfileDetailModelSelect(p){
+  var sel = document.getElementById('profileDetailModel');
+  var hint = document.getElementById('profileDetailModelHint');
+  if (!sel) return;
+  sel.innerHTML = '<option value="">' + esc(t('profile_model_use_default') || 'Use provider default') + '</option>';
+  try {
+    var data = await api('/api/models');
+    var groups = (Array.isArray(data && data.groups) && data.groups.length) ? data.groups : [];
+    for (var gi=0; gi<groups.length; gi++) {
+      var g = groups[gi];
+      var og = document.createElement('optgroup');
+      og.label = g.provider || g.provider_id || 'Configured';
+      if (g.provider_id) og.dataset.provider = g.provider_id;
+      var models = [];
+      if (Array.isArray(g.models)) models = models.concat(g.models);
+      if (Array.isArray(g.extra_models)) models = models.concat(g.extra_models);
+      for (var mi=0; mi<models.length; mi++) {
+        var m = models[mi];
+        if (!m || !m.id) continue;
+        var opt = document.createElement('option');
+        opt.value = m.id;
+        opt.textContent = m.label || m.id;
+        og.appendChild(opt);
+      }
+      if (og.children.length) sel.appendChild(og);
+    }
+    if (p && p.model) {
+      if (typeof _applyModelToDropdown === 'function') {
+        try { _applyModelToDropdown(p.model, sel, p.provider || (data && data.active_provider) || window._activeProvider || null); } catch(_){}
+      } else {
+        for (var oi=0; oi<sel.options.length; oi++) if (sel.options[oi].value === p.model) { sel.options[oi].selected = true; break; }
+      }
+      if (hint) hint.innerHTML = 'Current: <code>' + esc(p.model) + '</code>';
+    }
+  } catch (e) {
+    console.warn('populate profile detail model:', e && e.message);
+  }
+  sel.addEventListener('change', function(){
+    var h = document.getElementById('profileDetailModelHint');
+    if (!h) return;
+    var v = sel.value || '(provider default)';
+    h.innerHTML = 'Selected: <code>' + esc(v) + '</code>';
+  });
+}
+
+async function saveProfileModel(profileName){
+  var sel = document.getElementById('profileDetailModel');
+  var err = document.getElementById('profileDetailModelErr');
+  var btn = document.getElementById('btnSaveProfileModel');
+  if (!sel) return;
+  if (err) { err.style.display = 'none'; err.textContent = ''; }
+  var raw = (sel.value || '').trim();
+  var payload = { name: profileName };
+  if (raw) {
+    var st = null;
+    if (typeof _modelStateForSelect === 'function') { try { st = _modelStateForSelect(sel, raw); } catch(_){} }
+    if (st && st.model) payload.default_model = st.model; else payload.default_model = raw;
+    // Preserve target profile's provider shape. Bare `custom` is valid config;
+    // do not stamp catalog's named `custom:<host>` onto another agent.
+    var target = (_profilesCache && Array.isArray(_profilesCache.profiles))
+      ? _profilesCache.profiles.find(function(x){ return x.name === profileName; }) : null;
+    if (target && target.provider === 'custom') payload.model_provider = 'custom';
+    else if (st && st.model_provider) payload.model_provider = st.model_provider;
+  } else {
+    payload.default_model = '';
+    payload.model_provider = '';
+  }
+  var doSave = async function(){
+    var res = await api('/api/profile/update', { method: 'POST', body: JSON.stringify(payload) });
+    showToast(t('profile_updated') || 'Profile model updated');
+    await loadProfilesPanel();
+    if (res && res.profile && res.profile.name) openProfileDetail(res.profile.name);
+    else openProfileDetail(profileName);
+  };
+  if (btn) {
+    btn.disabled = true; var old = btn.innerHTML; btn.innerHTML = esc(t('saving')||'Saving...');
+    try { await doSave(); } catch(e) { if (err) { err.textContent = e.message || (t('save_failed')||'Save failed'); err.style.display=''; } else showToast(e.message||'Save failed',4000,'error'); }
+    finally { btn.disabled = false; btn.innerHTML = old; }
+    return;
+  }
+  try { await doSave(); } catch(e) { if (err) { err.textContent = e.message || (t('save_failed')||'Save failed'); err.style.display=''; } else showToast(e.message||'Save failed',4000,'error'); }
+}
+
+var _kanbanNotifiedRunning = new Set();
+function _kanbanToastRunning(tasks){
+  try {
+    if (!Array.isArray(tasks)) return;
+    for (var i=0;i<tasks.length;i++){
+      var task=tasks[i];
+      if (String(task.status||'').toLowerCase() !== 'running') continue;
+      var id=String(task.id||'');
+      if (!id || _kanbanNotifiedRunning.has(id)) continue;
+      _kanbanNotifiedRunning.add(id);
+      var title=String(task.title||id).slice(0,80);
+      var assignee=task.assignee ? ' @'+String(task.assignee) : '';
+      try{ showToast('\u25B6 '+title+assignee+' \u2014 running'); }catch(_){}
+    }
+  } catch(_){}
+}
+
+
 // Back-compat
 const submitProfileCreate = saveProfileForm;
 function toggleProfileForm(){ openProfileCreate();
@@ -8221,6 +8370,23 @@ async function deleteProfile(name) {
     showToast(t('profile_deleted', name));
   } catch (e) { showToast(t('delete_failed') + e.message); }
 }
+
+
+// Kanban tasks -> toast bridge: wrap api() to detect tasks list
+(function(){
+  const _origApi = window.api;
+  if (!_origApi || _origApi._kanbanWrapped) return;
+  window.api = async function(path, opts){
+    const res = await _origApi(path, opts);
+    try{
+      if (typeof path === 'string' && path.indexOf('/api/kanban/tasks') >= 0 && res && Array.isArray(res.tasks)) {
+        _kanbanToastRunning(res.tasks);
+      }
+    }catch(_){}
+    return res;
+  };
+  window.api._kanbanWrapped = true;
+})();
 
 // ── Memory panel ──
 async function loadMemory(force) {
