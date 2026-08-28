@@ -13,6 +13,7 @@ Supported operations:
 
 from __future__ import annotations
 
+import inspect
 import json
 from api.sse_chunked import end_sse_headers
 import time
@@ -358,25 +359,28 @@ def _create_task_payload(body: dict, *, board=None):
         if not _wp:
             raise ValueError(f"space {space_id!r} has no workspace path")
     with _conn(board=board) as conn:
-        task_id = kb.create_task(
-            conn,
-            title=title,
-            body=body.get("body") or None,
-            assignee=body.get("assignee") or None,
-            created_by=body.get("created_by") or "webui",
-            tenant=body.get("tenant") or None,
-            priority=priority,
-            parents=body.get("parents") or (),
-            triage=bool(body.get("triage") or False),
-            workspace_kind=_wk,
-            workspace_path=_wp,
-            workspace_space_id=space_id,
-            workspace_transport=space.get("transport") if space else None,
-            workspace_ssh_target=space.get("ssh_target") if space else None,
-            idempotency_key=body.get("idempotency_key") or None,
-            max_runtime_seconds=body.get("max_runtime_seconds") or None,
-            skills=body.get("skills") or None,
-        )
+        task_kwargs = {
+            "title": title,
+            "body": body.get("body") or None,
+            "assignee": body.get("assignee") or None,
+            "created_by": body.get("created_by") or "webui",
+            "tenant": body.get("tenant") or None,
+            "priority": priority,
+            "parents": body.get("parents") or (),
+            "triage": bool(body.get("triage") or False),
+            "workspace_kind": _wk,
+            "workspace_path": _wp,
+            "workspace_space_id": space_id,
+            "workspace_transport": space.get("transport") if space else None,
+            "workspace_ssh_target": space.get("ssh_target") if space else None,
+            "idempotency_key": body.get("idempotency_key") or None,
+            "max_runtime_seconds": body.get("max_runtime_seconds") or None,
+            "skills": body.get("skills") or None,
+        }
+        supported = inspect.signature(kb.create_task).parameters
+        if not any(p.kind == inspect.Parameter.VAR_KEYWORD for p in supported.values()):
+            task_kwargs = {key: value for key, value in task_kwargs.items() if key in supported}
+        task_id = kb.create_task(conn, **task_kwargs)
         if requested_status:
             _patch_task(conn, task_id, {"status": requested_status})
         return {"task": _task_dict(kb.get_task(conn, task_id)), "read_only": False}

@@ -67,6 +67,38 @@ def test_create_task_payload_keeps_remote_space_target(monkeypatch):
     assert task["workspace_kind"] == "dir"
 
 
+def test_create_task_payload_works_with_older_runtime_signature(monkeypatch):
+    captured = {}
+
+    def legacy_create_task(conn, *, title, workspace_kind="scratch", workspace_path=None, **kwargs):
+        captured.update(title=title, workspace_kind=workspace_kind, workspace_path=workspace_path)
+        return "t_legacy"
+
+    monkeypatch.setattr(bridge, "load_workspaces", lambda: [REMOTE_SPACE])
+    monkeypatch.setattr(bridge, "_conn", lambda board=None: _Connection())
+    monkeypatch.setattr(
+        bridge,
+        "_kb",
+        lambda: SimpleNamespace(
+            create_task=legacy_create_task,
+            get_task=lambda conn, task_id: SimpleNamespace(
+                id=task_id,
+                title=captured["title"],
+                workspace_kind=captured["workspace_kind"],
+                workspace_path=captured["workspace_path"],
+            ),
+        ),
+    )
+
+    result = bridge._create_task_payload({
+        "title": "legacy runtime task",
+        "space_id": "remote-mac-saas",
+        "workspace_kind": "dir",
+    })
+    assert result["task"]["workspace_path"] == REMOTE_SPACE["remote_path"]
+    assert captured["workspace_path"] == REMOTE_SPACE["remote_path"]
+
+
 class _Connection:
     def __enter__(self):
         return self
