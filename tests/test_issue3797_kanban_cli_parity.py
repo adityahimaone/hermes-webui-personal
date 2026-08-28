@@ -70,8 +70,8 @@ class TestWorkspacePathValidation:
         """The create/edit payload must include workspace_kind and workspace_path on create only."""
         # In create branch (not isEdit)
         assert "payload.workspace_kind = workspaceKind" in PANELS_JS
-        # Path is optional for non-create, but must be sent when present
-        assert "if (workspacePathVal) payload.workspace_path = workspacePathVal" in PANELS_JS
+        # Saved Space owns target; manual path only applies without a Space.
+        assert "if (workspacePathVal && !spaceId) payload.workspace_path = workspacePathVal;" in PANELS_JS
 
     def test_workspace_fields_not_sent_on_edit(self):
         """submitKanbanTaskModal must NOT send workspace_kind/path when editing."""

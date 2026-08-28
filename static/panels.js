@@ -3346,11 +3346,14 @@ function _kanbanPopulateSpaces(currentValue){
 function _kanbanOnSpaceChange(){
   const spaceEl = document.getElementById('kanbanTaskModalSpace');
   const pathRowEl = document.getElementById('kanbanTaskModalWorkspacePathRow');
+  const advancedEl = document.getElementById('kanbanTaskModalAdvancedWorkspace');
   if (!spaceEl || !pathRowEl) return;
   if (spaceEl.value) {
     pathRowEl.style.display = 'none';
+    if (advancedEl) advancedEl.open = false;
     return;
   }
+  if (advancedEl) advancedEl.open = true;
   _kanbanOnWorkspaceKindChange();
 }
 
@@ -3766,7 +3769,7 @@ async function submitKanbanTaskModal(){
       if (!Number.isNaN(n)) payload.priority = n;
     }
     payload.workspace_kind = workspaceKind;
-    if (workspacePathVal) payload.workspace_path = workspacePathVal;
+    if (workspacePathVal && !spaceId) payload.workspace_path = workspacePathVal;
     if (skillsRaw) {
       payload.skills = skillsRaw.split(',').map(s => s.trim()).filter(Boolean);
     }
