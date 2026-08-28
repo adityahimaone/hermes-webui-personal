@@ -2646,6 +2646,22 @@ def _build_agent_thread_env(profile_runtime_env: dict | None, workspace: str, se
     agent starts, so merge into one dict first and let the active workspace win.
     """
     env = dict(profile_runtime_env or {})
+    # Kanban spaces own transport. A remote workspace path must never inherit
+    # profile-local terminal config; otherwise worker sees /Users/... on VPS.
+    try:
+        from api.workspace import load_workspaces
+        space = next((item for item in load_workspaces()
+                      if item.get("transport") == "ssh"
+                      and item.get("remote_path") == str(workspace)), None)
+        if space:
+            env.update({
+                "TERMINAL_ENV": "ssh",
+                "TERMINAL_SSH_HOST": str(space.get("ssh_target") or ""),
+                "TERMINAL_CWD": str(space["remote_path"]),
+            })
+    except Exception:
+        # Preserve existing profile-env fallback for older installations.
+        pass
     env.update({
         'TERMINAL_CWD': str(workspace),
         'HERMES_EXEC_ASK': '1',
