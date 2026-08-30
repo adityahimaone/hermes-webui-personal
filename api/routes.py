@@ -1216,19 +1216,40 @@ def _gateway_status_payload() -> dict:
     health_reason = details.get("reason")
     health_state = details.get("state")
     health_gateway_state = details.get("gateway_state")
+    # Kanban activity forces the UI to show the worker as alive even when
+    # gateway_state.json is stale (covers: VPS stale 3.5h but karina running f8-saas t_5dd6c5f3).
+    kanban_active = False
+    try:
+        from api.agent_health import _has_active_kanban_workers
+        kanban_active = bool(_has_active_kanban_workers())
+    except Exception:
+        kanban_active = False
+    # Expose to frontend
+    details = {**details, "kanban_active": kanban_active}
     if alive is True:
         running = True
         configured = True
     elif alive is False:
         running = False
         configured = True
+        # Keep health down even if kanban is active — gateway is known-dead.
+        # kanban_active is still exposed above for the toast path.
     else:
-        gateway_running_metadata = (
-            health_reason == "gateway_stale_running_state"
-            or health_gateway_state == "running"
-        )
-        configured = True if gateway_running_metadata else bool(identity_map)
-        running = bool(identity_map)
+        # alive is None (unknown / stale). Promote to running when kanban active.
+        if kanban_active:
+            running = True
+            configured = True
+            alive = True
+            health_state = health_state or "alive"
+            health_reason = "kanban_active"
+            details = {**details, "state": health_state, "reason": health_reason}
+        else:
+            gateway_running_metadata = (
+                health_reason == "gateway_stale_running_state"
+                or health_gateway_state == "running"
+            )
+            configured = True if gateway_running_metadata else bool(identity_map)
+            running = bool(identity_map)
 
     platforms_set: set[str] = set()
     for meta in identity_map.values():
@@ -1265,6 +1286,7 @@ def _gateway_status_payload() -> dict:
             "state": health_state,
             "reason": health_reason,
             "gateway_state": health_gateway_state,
+            "kanban_active": kanban_active,
         },
     }
 
@@ -16722,6 +16744,35 @@ def handle_post(handler, parsed) -> bool:
         except PermissionError as e:
             return bad(handler, _sanitize_error(e), 403)
         except (ValueError, FileExistsError, RuntimeError) as e:
+            return bad(handler, str(e))
+
+    if parsed.path == "/api/profile/update":
+        name = body.get("name", "").strip()
+        if not name:
+            return bad(handler, "name is required")
+        default_model = body.get("default_model", "").strip() if body.get("default_model") else None
+        model_provider = body.get("model_provider", "").strip() if body.get("model_provider") else None
+        base_url = body.get("base_url", "").strip() if body.get("base_url") else None
+        try:
+            from api.profiles import update_profile_api
+            result = update_profile_api(
+                name,
+                default_model=default_model,
+                model_provider=model_provider,
+                base_url=base_url,
+            )
+            # Invalidate models cache so the next /api/models reflects the new default.
+            try:
+                from api.config import invalidate_models_cache
+                invalidate_models_cache()
+            except Exception:
+                pass
+            return j(handler, {"ok": True, **result})
+        except PermissionError as e:
+            return bad(handler, _sanitize_error(e), 403)
+        except FileNotFoundError as e:
+            return bad(handler, _sanitize_error(e), 404)
+        except (ValueError, RuntimeError) as e:
             return bad(handler, str(e))
 
     if parsed.path == "/api/profile/delete":

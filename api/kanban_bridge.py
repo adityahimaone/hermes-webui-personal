@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import inspect
 import json
+import os
+import subprocess
 from api.sse_chunked import end_sse_headers
 import time
 from dataclasses import asdict, is_dataclass
@@ -333,6 +335,27 @@ def _set_status_direct(conn, task_id: str, new_status: str) -> bool:
     return True
 
 
+def _resolve_space_snapshot(space_id: str) -> dict:
+    space = next((item for item in load_workspaces() if item.get("id") == space_id), None)
+    if not space:
+        raise ValueError(f"unknown space_id: {space_id}")
+    transport = space.get("transport", "local")
+    if transport not in {"local", "ssh"}:
+        raise ValueError(f"unsupported space transport: {transport!r}")
+    path = space.get("remote_path") if transport == "ssh" else space.get("path")
+    if not path:
+        raise ValueError(f"space {space_id!r} has no workspace path")
+    if transport == "ssh" and not space.get("ssh_target"):
+        raise ValueError(f"space {space_id!r} has no SSH target")
+    return {
+        "workspace_kind": "dir",
+        "workspace_path": path,
+        "workspace_space_id": space_id,
+        "workspace_transport": transport,
+        "workspace_ssh_target": space.get("ssh_target") if transport == "ssh" else None,
+    }
+
+
 def _create_task_payload(body: dict, *, board=None):
     """Create a new task from a parsed request body and return the task dict in a read_only envelope."""
     title = str(body.get("title") or "").strip()
@@ -347,17 +370,11 @@ def _create_task_payload(body: dict, *, board=None):
     _wk = body.get("workspace_kind") or "scratch"
     _wp = body.get("workspace_path") or None
     space_id = str(body.get("space_id") or "").strip() or None
-    space = None
+    snapshot = None
     if space_id:
-        space = next((item for item in load_workspaces() if item.get("id") == space_id), None)
-        if not space:
-            raise ValueError(f"unknown space_id: {space_id}")
-        transport = space.get("transport", "local")
-        if transport not in {"local", "ssh"}:
-            raise ValueError(f"unsupported space transport: {transport!r}")
-        _wp = space.get("remote_path") if transport == "ssh" else space.get("path")
-        if not _wp:
-            raise ValueError(f"space {space_id!r} has no workspace path")
+        snapshot = _resolve_space_snapshot(space_id)
+        _wk = snapshot["workspace_kind"]
+        _wp = snapshot["workspace_path"]
     with _conn(board=board) as conn:
         task_kwargs = {
             "title": title,
@@ -370,15 +387,22 @@ def _create_task_payload(body: dict, *, board=None):
             "triage": bool(body.get("triage") or False),
             "workspace_kind": _wk,
             "workspace_path": _wp,
-            "workspace_space_id": space_id,
-            "workspace_transport": space.get("transport") if space else None,
-            "workspace_ssh_target": space.get("ssh_target") if space else None,
+            "workspace_space_id": snapshot["workspace_space_id"] if snapshot else None,
+            "workspace_transport": snapshot["workspace_transport"] if snapshot else None,
+            "workspace_ssh_target": snapshot["workspace_ssh_target"] if snapshot else None,
             "idempotency_key": body.get("idempotency_key") or None,
             "max_runtime_seconds": body.get("max_runtime_seconds") or None,
             "skills": body.get("skills") or None,
         }
         supported = inspect.signature(kb.create_task).parameters
-        if not any(p.kind == inspect.Parameter.VAR_KEYWORD for p in supported.values()):
+        remote_fields = {"workspace_space_id", "workspace_transport", "workspace_ssh_target"}
+        accepts_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in supported.values())
+        if snapshot and snapshot["workspace_transport"] == "ssh" and not accepts_kwargs and not remote_fields.issubset(supported):
+            raise ValueError(
+                "Hermes Agent runtime does not support persistent remote Space routing; "
+                "update Hermes Agent before creating this task."
+            )
+        if not accepts_kwargs:
             task_kwargs = {key: value for key, value in task_kwargs.items() if key in supported}
         task_id = kb.create_task(conn, **task_kwargs)
         if requested_status:
@@ -394,6 +418,11 @@ def _patch_task(conn, task_id: str, body: dict):
         raise LookupError("task not found")
 
     updates = {}
+    if "space_id" in body:
+        space_id = str(body.get("space_id") or "").strip()
+        if not space_id:
+            raise ValueError("space_id is required")
+        updates.update(_resolve_space_snapshot(space_id))
     if "title" in body:
         title = str(body.get("title") or "").strip()
         if not title:
@@ -578,6 +607,43 @@ def _task_detail_payload(task_id: str, *, board=None):
             "runs": [_obj_dict(r) for r in kb.list_runs(conn, task_id)],
             "read_only": False,
         }
+
+
+def _workspace_health_payload(task_id: str, *, board=None):
+    """Run a bounded, read-only probe against task workspace routing."""
+    kb = _kb()
+    with _conn(board=board) as conn:
+        task = kb.get_task(conn, task_id)
+        if not task:
+            return None
+        transport = getattr(task, "workspace_transport", None)
+        workspace = getattr(task, "workspace_path", None) or ""
+        if transport == "ssh":
+            target = getattr(task, "workspace_ssh_target", None)
+            space_id = getattr(task, "workspace_space_id", None)
+            if not (space_id and target and workspace and os.path.isabs(workspace)):
+                raise ValueError("incomplete SSH workspace snapshot")
+            try:
+                result = subprocess.run(
+                    ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", str(target), "test", "-d", workspace],
+                    capture_output=True, text=True, timeout=10, check=False,
+                )
+            except subprocess.TimeoutExpired:
+                return {"task_id": task_id, "health": {"status": "unreachable", "checked_at": int(time.time()), "checks": [{"name": "ssh", "status": "error", "detail": "connection timed out"}]}}
+            if result.returncode != 0:
+                detail = (result.stderr or "").strip() or "SSH connection failed"
+                return {"task_id": task_id, "health": {"status": "unreachable", "checked_at": int(time.time()), "checks": [{"name": "ssh", "status": "error", "detail": detail[:240]}]}}
+            checks = [
+                {"name": "ssh", "status": "ok", "detail": f"Connected to {target}"},
+                {"name": "workspace", "status": "ok", "detail": f"Path exists: {workspace}"},
+            ]
+        else:
+            if transport not in (None, "local"):
+                raise ValueError(f"unknown workspace transport: {transport}")
+            if not workspace or not os.path.isdir(workspace):
+                return {"task_id": task_id, "health": {"status": "degraded", "checked_at": int(time.time()), "checks": [{"name": "workspace", "status": "error", "detail": "path is not accessible"}]}}
+            checks = [{"name": "workspace", "status": "ok", "detail": f"Path exists: {workspace}"}]
+        return {"task_id": task_id, "health": {"status": "healthy", "checked_at": int(time.time()), "checks": checks}}
 
 
 def _events_payload(parsed):
@@ -1245,6 +1311,14 @@ def handle_kanban_get(handler, parsed) -> bool | None:
             return j(handler, _events_payload(parsed)) or True
         if path == "/api/kanban/events/stream":
             return _handle_events_sse_stream(handler, parsed)
+        if path.startswith(_TASK_PREFIX) and path.endswith("/health"):
+            task_id = unquote(path[len(_TASK_PREFIX):-len("/health")]).strip("/")
+            if not task_id or "/" in task_id:
+                return False
+            payload = _workspace_health_payload(task_id, board=_resolve_board(parsed))
+            if payload is None:
+                return bad(handler, "task not found", status=404)
+            return j(handler, payload) or True
         if path.startswith(_TASK_PREFIX) and path.endswith("/log"):
             task_id = unquote(path[len(_TASK_PREFIX):-len("/log")]).strip("/")
             if not task_id or "/" in task_id:

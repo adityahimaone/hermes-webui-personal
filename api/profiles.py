@@ -13,6 +13,7 @@ import logging
 import os
 import re
 import shutil
+import sqlite3
 import sys
 import threading
 from contextlib import contextmanager
@@ -2034,6 +2035,71 @@ def _build_profile_rows_fast() -> list | None:
     return rows
 
 
+_PROFILE_STATUS_CHAT_WINDOW_SECONDS = 15 * 60
+_PROFILE_STATUS_HEARTBEAT_WINDOW_SECONDS = 15 * 60
+
+
+def _profile_status_kanban_tasks(now: float) -> list[dict]:
+    """Read active Kanban tasks across boards without mutating databases."""
+    tasks = []
+    root = Path(os.path.expanduser("~/.hermes")) / "kanban" / "boards"
+    try:
+        board_paths = sorted(root.glob("*/kanban.db"))
+    except OSError:
+        return tasks
+    for db_path in board_paths:
+        try:
+            with sqlite3.connect(f"file:{db_path.resolve()}?mode=ro", uri=True, timeout=0.5) as conn:
+                columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
+                wanted = {"id", "title", "assignee", "status", "claim_lock", "claim_expires", "worker_pid", "last_heartbeat_at"}
+                if not wanted <= columns:
+                    continue
+                rows = conn.execute(
+                    "SELECT id,title,assignee,status,claim_lock,claim_expires,worker_pid,last_heartbeat_at "
+                    "FROM tasks WHERE status='running' OR (claim_expires IS NOT NULL AND claim_expires > ?) "
+                    "OR (last_heartbeat_at IS NOT NULL AND last_heartbeat_at > ? AND status NOT IN ('done','blocked'))",
+                    (now, now - _PROFILE_STATUS_HEARTBEAT_WINDOW_SECONDS),
+                )
+                for row in rows:
+                    task = dict(zip(("id", "title", "assignee", "status", "claim_lock", "claim_expires", "worker_pid", "last_heartbeat_at"), row))
+                    task["board"] = db_path.parent.name
+                    tasks.append(task)
+        except (OSError, sqlite3.Error):
+            continue
+    return tasks
+
+
+def _profile_status(name: str, profile_home: Path, *, now: float | None = None, kanban_tasks: list[dict] | None = None) -> dict:
+    """Return conservative per-profile status and activity provenance."""
+    import time
+    now = time.time() if now is None else float(now)
+    tasks = kanban_tasks if kanban_tasks is not None else _profile_status_kanban_tasks(now)
+    matching = [t for t in tasks if str(t.get("status") or "").lower() == "running" and (not t.get("assignee") or str(t.get("assignee")).strip().lower() == name.lower())]
+    if matching:
+        task = matching[0]
+        return {"status": "running", "source": "kanban", "title": task.get("title") or task.get("id"), "board": task.get("board"), "last_activity": task.get("last_heartbeat_at") or task.get("claim_expires"), "pid": task.get("worker_pid"), "heartbeat": task.get("last_heartbeat_at")}
+    db_path = profile_home / "state.db"
+    latest = None
+    try:
+        with sqlite3.connect(f"file:{db_path.resolve()}?mode=ro", uri=True, timeout=0.5) as conn:
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
+            if "profile_name" in cols and "last_activity_at" in cols:
+                latest = conn.execute(
+                    "SELECT title,last_activity_at,ended_at FROM sessions WHERE (profile_name=? OR profile_name IS NULL) "
+                    "AND last_activity_at IS NOT NULL ORDER BY last_activity_at DESC LIMIT 1", (name,)
+                ).fetchone()
+    except (OSError, sqlite3.Error):
+        latest = None
+    if latest and float(latest[1]) >= now - _PROFILE_STATUS_CHAT_WINDOW_SECONDS and latest[2] is None:
+        return {"status": "busy", "source": "chat", "title": latest[0] or "Chat session", "board": None, "last_activity": latest[1], "pid": None, "heartbeat": None}
+    return {"status": "idle", "source": None, "title": None, "board": None, "last_activity": latest[1] if latest else None, "pid": None, "heartbeat": None}
+
+
+def _add_profile_status(rows: list[dict]) -> list[dict]:
+    tasks = _profile_status_kanban_tasks(__import__('time').time())
+    return [{**row, "status": _profile_status(row["name"], Path(row["path"]), kanban_tasks=tasks)} for row in rows]
+
+
 def list_profiles_api() -> list:
     """List all profiles with metadata, serialized for JSON response.
 
@@ -2068,7 +2134,7 @@ def list_profiles_api() -> list:
                     same_home = False
                 if p.name == active and same_home:
                     enabled_count, total_count = _get_profile_skills_stats(p.path)
-                    return [{
+                    return _add_profile_status([{
                         'name': p.name,
                         'path': str(p.path),
                         'is_default': p.is_default,
@@ -2081,7 +2147,7 @@ def list_profiles_api() -> list:
                         'skill_count': enabled_count,
                         'enabled_skills': enabled_count,
                         'total_skills': total_count,
-                    }]
+                    }])
         except (ImportError, OSError, PermissionError):
             pass
         # Fallback: construct profile dict with actual active name and hermes_home path
@@ -2150,7 +2216,7 @@ def list_profiles_api() -> list:
         return result
 
     active = get_active_profile_name()
-    return [{**p, 'is_active': p['name'] == active} for p in rows]
+    return _add_profile_status([{**p, 'is_active': p['name'] == active} for p in rows])
 
 
 def _profile_visible_from_meta(profile_path: Path) -> bool:
@@ -2444,13 +2510,16 @@ def _profile_model_selection_exists(
 
     provider_seen = False
     model_seen = False
+    bare_custom = (model_provider or "").strip().lower() == "custom"
     for group in available_models.get("groups", []) or []:
         if not isinstance(group, dict):
             continue
         provider_id = str(group.get("provider_id") or "").strip()
-        if model_provider and provider_id != model_provider:
+        if model_provider and not bare_custom and provider_id != model_provider:
             continue
-        if model_provider and provider_id == model_provider:
+        if bare_custom and not provider_id.lower().startswith("custom"):
+            continue
+        if model_provider and (provider_id == model_provider or bare_custom):
             provider_seen = True
         all_group_models = (group.get("models") or []) + (group.get("extra_models") or [])
         for model in all_group_models:
@@ -2644,6 +2713,81 @@ def create_profile_api(name: str, clone_from: str = None,
         'skill_count': 0,
         'enabled_skills': 0,
         'total_skills': 0,
+    }
+
+
+def update_profile_api(
+    name: str,
+    *,
+    default_model: str | None = None,
+    model_provider: str | None = None,
+    base_url: str | None = None,
+) -> dict:
+    """Update an existing profile's model config.
+
+    Validates existence, name, and model catalog before writing to config.yaml.
+    Does not clone — only patches model.default / model.provider / model.base_url.
+    ponytail: no generic key/value passthrough; extend when more fields needed.
+    """
+    name = str(name or "").strip()
+    if not name:
+        raise ValueError("name is required")
+    if _is_root_profile(name):
+        # Locate the actual root profile directory (could be _DEFAULT_HERMES_HOME
+        # or a renamed-root subdir). _is_root_profile covers both.
+        profile_dir = get_hermes_home_for_profile(name)
+    else:
+        _validate_profile_name(name)
+        profile_dir = get_hermes_home_for_profile(name)
+        if not profile_dir.is_dir():
+            raise FileNotFoundError(f"Profile '{name}' does not exist.")
+        # Reject path that escapes profiles root (defense in depth — validate already did).
+        try:
+            profile_dir.resolve().relative_to(_profiles_root().resolve())
+        except ValueError:
+            raise ValueError(f"Invalid profile name {name!r}")
+    # Also check root profile directory exists (it always does, but be explicit)
+    if _is_root_profile(name) and not profile_dir.is_dir():
+        raise FileNotFoundError(f"Profile '{name}' does not exist.")
+    default_model, model_provider = _split_webui_provider_model_value(default_model, model_provider)
+    # Validate requested model/provider against catalog (no-op when both None)
+    # Only validate when caller actually supplied a model/provider choice.
+    if default_model is not None or model_provider is not None:
+        _validate_profile_model_selection(default_model, model_provider)
+        _write_model_defaults_to_config(
+            profile_dir, default_model=default_model, model_provider=model_provider
+        )
+    if base_url is not None:
+        cleaned = _clean_profile_config_value(base_url, "base_url") if base_url else None
+        if cleaned and not cleaned.startswith(("http://", "https://")):
+            raise ValueError("base_url must start with http:// or https://")
+        if cleaned:
+            _write_endpoint_to_config(profile_dir, base_url=cleaned)
+    # Bust caches so subsequent reads see the new model.
+    _SKILLS_STATS_CACHE.clear()
+    _invalidate_list_profiles_cache()
+    # Return fresh profile info plus the effective model fields we just wrote.
+    # Read back config.yaml to reflect what is actually on disk (including provider
+    # normalization done by _split_webui_provider_model_value).
+    try:
+        cfg = yaml.safe_load((profile_dir / "config.yaml").read_text(encoding="utf-8")) or {}
+    except Exception:
+        cfg = {}
+    model_section = cfg.get("model", {}) if isinstance(cfg, dict) else {}
+    effective_default = model_section.get("default") if isinstance(model_section, dict) else None
+    effective_provider = model_section.get("provider") if isinstance(model_section, dict) else None
+    effective_base = model_section.get("base_url") if isinstance(model_section, dict) else None
+    # Also resolve provider from list_profiles_api for the name we return (authoritative).
+    prof_info = None
+    for p in list_profiles_api():
+        if p.get("name") == name or _profiles_match(p.get("name"), name):
+            prof_info = p
+            break
+    return {
+        "profile": prof_info or {"name": name, "path": str(profile_dir)},
+        "default_model": effective_default,
+        "provider": effective_provider,
+        "base_url": effective_base,
     }
 
 

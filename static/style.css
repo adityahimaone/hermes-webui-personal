@@ -7023,6 +7023,8 @@ main.main.showing-insights > #mainInsights{display:flex;overflow-y:auto;}
    the browser's default beveled appearance which clashes with the dark
    theme. Scoped to kanban-* parent containers so the rules cannot affect
    any other panel that happens to use those class names later. */
+.kanban-health-row{display:flex;align-items:center;gap:8px;grid-column:1/-1;padding:6px 8px;border:1px solid var(--border);border-radius:6px;background:var(--panel)}
+.kanban-health-row.healthy{border-color:#2e9b62}.kanban-health-row.degraded{border-color:#c58a25}.kanban-health-row.unreachable{border-color:#bd4c4c}.kanban-health-dot{width:8px;height:8px;border-radius:50%;background:#c58a25;flex:none}.kanban-health-row.healthy .kanban-health-dot{background:#2e9b62}.kanban-health-row.unreachable .kanban-health-dot{background:#bd4c4c}.kanban-health-label{font-weight:600}.kanban-health-checks{color:var(--muted);font-size:12px}.kanban-health-ping{margin-left:auto;padding:3px 8px;font-size:11px}
 .kanban-pane .btn,
 .kanban-bulk-bar .btn,
 .kanban-new-task-row .btn,

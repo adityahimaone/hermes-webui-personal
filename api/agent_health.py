@@ -714,6 +714,61 @@ def _reset_remote_probe_cache_for_tests() -> None:
         _remote_probe_cond.notify_all()
 
 
+def _has_active_kanban_workers() -> bool:
+    """Return True when any kanban task or worker process indicates activity.
+
+    Checks in order (cheap first):
+      1. Any task with status='running' in any known kanban board DB.
+      2. Any live \"hermes ... kanban\" / \"hermes ... work kanban\" process.
+    All steps are best-effort and return False on error.
+    ponytail: no per-profile scoping yet — add board arg when needed.
+    """
+    # 1) DB check across root + boards dirs
+    try:
+        import sqlite3
+        from pathlib import Path
+        roots: list[Path] = []
+        try:
+            from api.profiles import _DEFAULT_HERMES_HOME as _BASE
+            roots.append(Path(_BASE) / "kanban.db")
+            boards_dir = Path(_BASE) / "kanban" / "boards"
+            if boards_dir.is_dir():
+                for board_path in boards_dir.iterdir():
+                    db = board_path / "kanban.db"
+                    if db.is_file():
+                        roots.append(db)
+        except Exception:
+            pass
+        for db in roots:
+            try:
+                conn = sqlite3.connect(str(db), timeout=1.0)
+                try:
+                    cur = conn.execute("SELECT 1 FROM tasks WHERE status='running' LIMIT 1")
+                    if cur.fetchone() is not None:
+                        return True
+                finally:
+                    conn.close()
+            except Exception:
+                continue
+    except Exception:
+        pass
+    # 2) Process check
+    try:
+        import subprocess
+        out = subprocess.run(
+            ["ps", "aux"], capture_output=True, text=True, timeout=3
+        ).stdout
+        for line in out.splitlines():
+            low = line.lower()
+            if "hermes" in low and "kanban" in low:
+                # Exclude this helper's own ps invocation and editor grep lines
+                if "grep" not in low and "ps aux" not in low:
+                    return True
+    except Exception:
+        pass
+    return False
+
+
 def build_agent_health_payload() -> dict[str, Any]:
     """Return `{alive, checked_at, details}` for the Hermes gateway/agent.
 

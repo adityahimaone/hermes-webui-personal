@@ -4,6 +4,7 @@ let _kanbanBoard = null;
 let _kanbanLatestEventId = 0;
 let _kanbanPollTimer = null;
 let _kanbanCurrentTaskId = null;
+let _kanbanHealthTimer = null;
 let _kanbanLanesByProfile = true;
 // Multi-board state. _kanbanCurrentBoard is the slug of the active board
 // the UI is currently viewing. null means "use whatever the server reports
@@ -3039,6 +3040,7 @@ async function unblockKanbanTask(taskId){
 }
 
 function closeKanbanTaskDetail(){
+  if (_kanbanHealthTimer) { clearInterval(_kanbanHealthTimer); _kanbanHealthTimer = null; }
   _kanbanCurrentTaskId = null;
   const preview = $('kanbanTaskPreview');
   if (preview) {
@@ -3488,6 +3490,8 @@ async function openKanbanEdit(taskId){
   await _kanbanPopulateAssigneeSelect(task.assignee || '');
   _kanbanSetTaskModalStatusHint(originalStatus, initialDisplayedStatus);
   _kanbanSetTaskModalLabels('edit');
+  _kanbanPopulateSpaces(task.workspace_space_id || '');
+  _kanbanOnSpaceChange();
   _kanbanPopulateTenantDatalist();
   // Workspace path combobox (with status dot) — init after populate so workspace list ready
   try { _kanbanPopulateWorkspacePathDatalist(); } catch(_){}
@@ -3563,6 +3567,8 @@ function _kanbanSetTaskModalLabels(mode){
     'kanbanTaskModalParents',
   ];
   const disabled = mode === 'edit';
+  const spaceEl = document.getElementById('kanbanTaskModalSpace');
+  if (spaceEl) spaceEl.disabled = false;
   for (const id of createOnlyIds) {
     const el = document.getElementById(id);
     if (el) el.disabled = disabled;
@@ -3757,8 +3763,7 @@ async function submitKanbanTaskModal(){
     }
     const n = parseInt(priorityRaw, 10);
     payload.priority = Number.isNaN(n) ? 0 : n;
-    // Note: workspace_kind and workspace_path are not sent on edit because
-    // the backend _patch_task does not handle them (they are dropped).
+    // Manual workspace fields stay create-only; edits route through canonical Space.
   } else {
     if (bodyVal.trim()) payload.body = bodyVal;
     if (statusVal) payload.status = statusVal;
@@ -3916,6 +3921,19 @@ async function kanbanGateAction(taskId, comment){
     await loadKanbanTask(taskId); await _kanbanRefreshBoard();
   }catch(e){ showToast(e.message||String(e),4000,'error'); }
 }
+async function pingKanbanTask(event, taskId){
+  if (event) event.stopPropagation();
+  const btn = event && event.currentTarget;
+  if (btn) { btn.disabled = true; btn.textContent = 'Pinging…'; }
+  try {
+    const health = (await api('/api/kanban/tasks/' + encodeURIComponent(taskId) + '/health' + _kanbanBoardQuery())).health;
+    const row = document.querySelector('.kanban-health-row');
+    if (row) { row.className = 'kanban-health-row ' + (health.status === 'healthy' ? 'healthy' : health.status === 'unreachable' ? 'unreachable' : 'degraded'); row.querySelector('.kanban-health-label').textContent = 'Workspace ' + health.status; row.querySelector('.kanban-health-checks').textContent = (health.checks || []).length + ' checks'; }
+    if (btn) btn.textContent = 'Ping';
+  } catch(e) { if (btn) btn.textContent = 'Retry'; showToast(e.message || String(e), 4000, 'error'); }
+  finally { if (btn) btn.disabled = false; }
+}
+
 function kanbanCopyTaskId(taskId){
   if(!taskId) return;
   try{ if(navigator.clipboard&&navigator.clipboard.writeText) navigator.clipboard.writeText(taskId); else { var ta=document.createElement('textarea'); ta.value=taskId; ta.style.position='fixed'; ta.style.opacity='0'; document.body.appendChild(ta); ta.select(); document.execCommand('copy'); ta.remove(); } showToast('Copied: '+taskId,2000); }catch(e){ showToast(e.message||String(e),4000,'error'); }
@@ -3928,6 +3946,9 @@ async function kanbanGateFix(taskId){
 function _kanbanRenderTaskDetail(data){
   const task = data.task || {};
   const log = data.log || {};
+  const health = data.health || null;
+  const healthLabel = health && health.status ? `Workspace ${health.status}` : 'Checking workspace';
+  const healthClass = health && health.status === 'healthy' ? 'healthy' : health && health.status === 'unreachable' ? 'unreachable' : 'degraded';
   const title = _kanbanTaskTitle(task);
   const body = _kanbanTaskBody(task) || t('kanban_no_description');
   const meta = _kanbanTaskMeta(task);
@@ -3956,6 +3977,7 @@ function _kanbanRenderTaskDetail(data){
     <div class="kanban-task-id-row" style="display:flex;align-items:center;gap:6px;margin:6px 0 10px 0;font-size:11px;color:var(--muted);"><span class="kanban-task-id-label" style="font-weight:600;letter-spacing:0.03em;text-transform:uppercase;">ID</span><code class="kanban-task-id" style="font-family:var(--font-mono,monospace);font-size:11px;padding:2px 6px;border:1px solid var(--border);border-radius:4px;background:var(--panel);user-select:all;word-break:break-all;">${esc(task.id||'')}</code><button class="btn secondary kanban-copy-id-btn" style="padding:2px 6px;font-size:11px;" onclick="kanbanCopyTaskId('${esc(task.id||'')}')" title="Copy task ID">⎘ Copy</button></div>
     <div class="kanban-task-preview-body">${_kanbanRenderMarkdown(body)}</div>
     ${meta.length ? `<div class="kanban-meta">${esc(meta.join(' · '))}</div>` : ''}
+    ${task.workspace_path ? `<div class="kanban-health-row ${healthClass}"><span class="kanban-health-dot"></span><span class="kanban-health-label">${esc(healthLabel)}</span>${health && health.checks ? `<span class="kanban-health-checks">${health.checks.length} checks</span>` : ''}<button class="btn secondary kanban-health-ping" onclick="pingKanbanTask(event,'${esc(task.id)}')">Ping</button></div>` : ''}
     ${_kanbanGateHtml(task, events)}
     <div class="kanban-status-actions">${statusButtons}</div>
     <div class="kanban-detail-grid">
@@ -3976,6 +3998,7 @@ async function loadKanbanTask(taskId){
   try {
     const data = await api('/api/kanban/tasks/' + encodeURIComponent(taskId) + _kanbanBoardQuery());
     try { data.log = await api('/api/kanban/tasks/' + encodeURIComponent(taskId) + '/log' + _kanbanBoardQuery({tail: 65536})); } catch(e) { data.log = {}; }
+    try { data.health = (await api('/api/kanban/tasks/' + encodeURIComponent(taskId) + '/health' + _kanbanBoardQuery())).health; } catch(e) { data.health = {status: 'unreachable', checks: [{name: 'health', status: 'error', detail: e.message || String(e)}]}; }
     _kanbanCurrentTaskId = taskId;
     const task = data.task || {};
     const title = _kanbanTaskTitle(task);
